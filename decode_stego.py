@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import wave
 
 def to_bin(data):
     """Convert data into binary format as string/list"""
@@ -43,12 +44,39 @@ def decode(image_name, n_bits=1):
     print("[!] Warning: stop marker not found")
     return decoded_data
 
+def decode_audio(file_name, n_bits=1):
+    print("[+] Decoding...")
+    with wave.open(file_name, "rb") as audio:
+        frames = bytearray(audio.readframes(audio.getnframes()))
+    if frames is None:
+        raise FileNotFoundError(f"Could not open {file_name}. Check path and extension.")
+
+    binary_data = ""
+    decoded_data = ""
+    stop_marker = "====="
+
+    for byte in frames:
+        # take the last n_bits from each byte in frames, convert to string
+        binary_data += format(byte & ((1 << n_bits) - 1), f'0{n_bits}b')
+ 
+
+        while len(binary_data) >= 8:
+            byte_data = binary_data[:8]
+            binary_data = binary_data[8:]
+            decoded_data += chr(int(byte_data, 2))
+            
+            # stop when marker is found
+            if decoded_data.endswith(stop_marker):
+                return decoded_data[:-len(stop_marker)]
+
+    print("[!] Warning: stop marker not found")
+    return decoded_data
 
 if __name__ == "__main__":
     print("=== LSB Steganography Decoder ===")
     input_file = input("Enter encoded BMP filename: ").strip()
-    if not input_file.lower().endswith(".bmp"):
-        input_file += ".bmp"
+    #if not input_file.lower().endswith(".bmp"):
+        #input_file += ".bmp"
 
     while True:
         try:
@@ -60,5 +88,8 @@ if __name__ == "__main__":
         except ValueError:
             print("⚠️ Invalid input. Enter a number between 1 and 8.")
 
-    hidden_message = decode(input_file, n_bits)
+    if input_file.endswith(".wav"):
+        hidden_message = decode_audio(input_file, n_bits)
+    else:
+        hidden_message = decode(input_file, n_bits)
     print("[+] Hidden Message:", hidden_message)

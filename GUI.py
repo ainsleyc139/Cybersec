@@ -1,6 +1,8 @@
 import sys, os
 import cv2
 import numpy as np
+import math
+import hashlib
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
@@ -59,7 +61,7 @@ def encode(image_name, secret_data, output_name, n_bits=1, key=None):
 
     cv2.imwrite(output_name, image)
 
-def decode(image_name, n_bits=1, key=None):
+def decode(image_name, n_bits, key=None):
     if key is None:
         raise ValueError("Key is required for decoding.")
     image = cv2.imread(image_name)
@@ -90,6 +92,12 @@ def compare_images(orig_path, stego_path):
         return "Images have different dimensions."
     diff = np.sum(orig != stego)
     return f"Number of pixel values changed: {diff}"
+def hash_key_to_int(key_string):
+    try:
+        hash_bytes = hashlib.sha256(key_string.encode('utf-8')).digest()
+        return int.from_bytes(hash_bytes[:4], byteorder='big')
+    except Exception as e:
+        raise ValueError(f"Invalid key: {e}")
 
 # ---------------- GUI ----------------
 class StegoMainWindow(QMainWindow):
@@ -226,12 +234,74 @@ class StegoMainWindow(QMainWindow):
         self.decode_tab.setLayout(layout)
 
     # ---------------- Encode Logic ----------------
+    def check_payload_fits(self, cover_path, payload_data, n_bits=1):
+        """Check if payload data fits into the cover image with given LSBs."""
+        if not os.path.exists(cover_path):
+            return False, f"❌ Cover file not found: {cover_path}"
+
+        # Cover capacity
+        image = cv2.imread(cover_path)
+        if image is None:
+            return False, f"❌ Could not open cover: {cover_path}"
+        h, w, channels = image.shape
+        cap_bits = w * h * channels * n_bits
+
+        # Payload size (including stop marker)
+        payload_with_marker = (payload_data or "") + STOP_MARKER
+        payload_bits = len(to_bin(payload_with_marker))
+
+        if payload_bits <= cap_bits:
+            return True, f"✅ Payload ({payload_bits:,} bits) fits in cover ({cap_bits:,} bits capacity)."
+        else:
+            pixels_needed = math.ceil(payload_bits / (3 * n_bits))
+            side = math.ceil(math.sqrt(pixels_needed))
+            return False, (
+                f"❌ Payload too large!\n"
+                f"   Payload size = {payload_bits:,} bits\n"
+                f"   Cover capacity = {cap_bits:,} bits\n"
+                f"   Needs at least {pixels_needed:,} pixels "
+                f"(suggested cover ≈ {side}×{side})."
+            )
+
     def load_cover_file(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Select Cover Image", "", "BMP Images (*.bmp)")
+        fname, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Cover File",
+            "",
+            "Supported Files (*.bmp *.png *.gif *.wav *.pcm);;All Files (*.*)"
+        )
+        if not fname:
+            return
+        
+        self.cover_path = fname
+        ext = os.path.splitext(fname)[1].lower()
+
+        if ext in [".bmp", ".png", ".gif"]:
+            # Handle as image
+            pixmap = QPixmap(fname).scaled(280, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.cover_label.setPixmap(pixmap)
+
+            image = cv2.imread(fname)
+            if image is not None:
+                h, w, channel = image.shape
+                print(f"Cover image loaded: {w}x{h}, Channels: {channel}")
+
+        elif ext in [".wav", ".pcm"]:
+            # Handle as audio
+            print(f"Audio file loaded: {fname}")
+            # TODO: Add your audio loading/preview logic here
+
+        else:
+            print("Unsupported file type")
+
         if fname:
             self.cover_path = fname
             pixmap = QPixmap(fname).scaled(280, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.cover_label.setPixmap(pixmap)
+            image = cv2.imread(fname)
+            if image is not None:
+                h, w, channel = image.shape
+                print(f"Cover loaded: {w}x{h}, Channels: {channel}")            
 
     def load_payload_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Payload File", "", "Text Files (*.txt)")
@@ -246,16 +316,23 @@ class StegoMainWindow(QMainWindow):
             return
         n_bits = self.lsb_spinbox.value()
         key_text = self.key_input.text().strip()
-        if not key_text.isdigit():
-            QMessageBox.warning(self, "Error", "Please enter a valid integer key.")
+        if not key_text.strip():
+            QMessageBox.warning(self, "Error", "Please enter a key.")
             return
-        key_val = int(key_text)
+        key_val = hash_key_to_int(key_text)
+        
+        # Check if payload fits in cover image
+        fits, message = self.check_payload_fits(self.cover_path, self.payload_data, n_bits)
+        if not fits:
+            QMessageBox.critical(self, "Payload Too Large", message)
+            return
+        
         try:
             output_file = "encoded_output.bmp"
             encode(self.cover_path, self.payload_data, output_file, n_bits, key_val)
             self.stego_path = output_file
             diff_msg = compare_images(self.cover_path, self.stego_path)
-            self.visualization_label.setText(f"✅ Payload embedded!\n{diff_msg}")
+            self.visualization_label.setText(f"✅ Payload embedded!\n{message}\n{diff_msg}")
         except Exception as e:
             QMessageBox.critical(self, "Encoding Failed", str(e))
 
@@ -282,10 +359,10 @@ class StegoMainWindow(QMainWindow):
             return
         n_bits = self.lsb_spinbox_decode.value()
         key_text = self.key_input_decode.text().strip()
-        if not key_text.isdigit():
-            QMessageBox.warning(self, "Error", "Please enter the same integer key used during encoding.")
+        if not key_text.strip():
+            QMessageBox.warning(self, "Error", "Please enter the same key used during encoding.")
             return
-        key_val = int(key_text)
+        key_val = hash_key_to_int(key_text)
         try:
             hidden_message = decode(self.stego_path, n_bits, key_val)
             self.preview_box.setPlainText(hidden_message)
@@ -302,6 +379,8 @@ class StegoMainWindow(QMainWindow):
             with open(fname, "w", encoding="utf-8") as f:
                 f.write(self.extracted_data)
             QMessageBox.information(self, "Saved", f"Payload saved as {fname}")
+
+
 
 # ---------------- Dark Theme ----------------
 def apply_dark_theme(app):

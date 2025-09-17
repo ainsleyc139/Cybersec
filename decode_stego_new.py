@@ -1,89 +1,99 @@
 import cv2
-import numpy as np
 
-def to_bin(data):
-    """Convert int or ndarray to binary string(s)."""
-    if isinstance(data, (int, np.integer)):
-        return format(int(data), "08b")
-    elif isinstance(data, np.ndarray):
-        return [format(int(i), "08b") for i in data]
-    else:
-        raise TypeError(f"Unsupported type: {type(data)}")
-
-
-def decode(image_name, n_bits=1):
-    print("[+] Decoding...")
+def decode(image_name, n_bits, x1, y1, x2, y2):
+    """Decode payload from stego image, using user-specified n_bits and region"""
     image = cv2.imread(image_name)
     if image is None:
-        raise FileNotFoundError(f"❌ Could not open {image_name}. Check path and extension.")
+        raise FileNotFoundError(f"❌ Could not open {image_name}")
 
+    # Step 1: extract header inside given region
+    header_str = extract_header(image, n_bits, x1, y1, x2, y2)
+    if not header_str:
+        raise ValueError("❌ No header found (check n_bits/region).")
+
+    print(f"[*] Raw header: {header_str}")
+
+    # Step 2: parse header
+    parts = header_str.split(";")
+    meta = {}
+    for p in parts:
+        if ":" in p:
+            k, v = p.split(":", 1)
+            meta[k] = v
+
+    if "SIZE" not in meta:
+        raise ValueError("❌ Invalid metadata header.")
+
+    size = int(meta["SIZE"])
+    if "FILE" in meta:
+        filename = meta["FILE"]
+        payload_type = "FILE"
+    else:
+        filename = None
+        payload_type = "TEXT"
+
+    # Step 3: extract payload
+    return extract_payload(image, x1, y1, x2, y2, n_bits, size, payload_type, filename)
+
+
+def extract_header(image, n_bits, x1, y1, x2, y2):
+    """Extract header from the specified region"""
     binary_data = ""
-    decoded_bytes = bytearray()
-    stop_marker = b"====="
+    decoded_data = ""
 
-    for row in image:
-        for pixel in row:
+    for y in range(y1, y2 + 1):
+        for x in range(x1, x2 + 1):
+            pixel = image[y, x]
             for channel in range(3):
-                binary_data += to_bin(pixel[channel])[-n_bits:]
-
+                binary_data += format(pixel[channel], "08b")[-n_bits:]
                 while len(binary_data) >= 8:
                     byte = binary_data[:8]
                     binary_data = binary_data[8:]
-                    decoded_bytes.append(int(byte, 2))
+                    decoded_data += chr(int(byte, 2))
+                    if decoded_data.endswith("====="):
+                        return decoded_data[:-5]  # strip marker
+    return None
 
-                    if decoded_bytes.endswith(stop_marker):
-                        decoded_bytes = decoded_bytes[:-len(stop_marker)]
-                        return decoded_bytes
 
-    raise ValueError("❌ Stop marker not found. Possibly wrong LSB count or corrupted data.")
+def extract_payload(image, x1, y1, x2, y2, n_bits, size, payload_type, filename):
+    """Extract payload from given region"""
+    binary_data = ""
+    payload_bytes = bytearray()
+    data_index = 0
+
+    for y in range(y1, y2 + 1):
+        for x in range(x1, x2 + 1):
+            pixel = image[y, x]
+            for channel in range(3):
+                binary_data += format(pixel[channel], "08b")[-n_bits:]
+                while len(binary_data) >= 8 and data_index < size:
+                    byte = binary_data[:8]
+                    binary_data = binary_data[8:]
+                    payload_bytes.append(int(byte, 2))
+                    data_index += 1
+                    if data_index >= size:
+                        break
+            if data_index >= size:
+                break
+        if data_index >= size:
+            break
+
+    if payload_type == "FILE":
+        with open(f"decoded_{filename}", "wb") as f:
+            f.write(payload_bytes)
+        print(f"[+] File extracted and saved as decoded_{filename}")
+    else:
+        message = payload_bytes.decode(errors="ignore")
+        print(f"[+] Hidden message extracted:\n{message}")
+
+    return payload_bytes
 
 
 if __name__ == "__main__":
-    print("=== LSB Steganography Decoder ===")
-    input_file = input("Enter encoded BMP filename: ").strip()
+    print("=== LSB Steganography Decoder (Manual Region) ===")
+    input_file = input("Enter stego BMP filename: ").strip()
     if not input_file.lower().endswith(".bmp"):
         input_file += ".bmp"
-
-    while True:
-        try:
-            n_bits = int(input("Enter number of LSBs used for encoding (1–8): ").strip())
-            if 1 <= n_bits <= 8:
-                break
-            else:
-                print("⚠️ Please enter a number between 1 and 8.")
-        except ValueError:
-            print("⚠️ Invalid input. Enter a number between 1 and 8.")
-
-    data = decode(input_file, n_bits)
-
-    # 🔹 Distinguish between text and file payloads
-    if data.startswith(b"FILE:"):
-        try:
-            # Parse filename
-            header_end = data.find(b";SIZE:")
-            if header_end == -1:
-                raise ValueError("❌ Malformed header: missing SIZE field.")
-
-            filename = data[5:header_end].decode(errors="ignore")
-
-            # Parse size
-            size_start = header_end + len(";SIZE:")
-            size_end = data.find(b";", size_start)
-            size = int(data[size_start:size_end].decode())
-
-            # Extract raw payload
-            payload = data[size_end+1:size_end+1+size]
-
-            out_name = f"decoded_{filename}"
-            with open(out_name, "wb") as f:
-                f.write(payload)
-
-            print(f"[+] File extracted and saved as {out_name}")
-        except Exception as e:
-            print(f"❌ Error extracting file: {e}")
-    else:
-        try:
-            message = data.decode()
-            print("[+] Hidden message:", message)
-        except UnicodeDecodeError:
-            print("[+] Hidden raw bytes (non-text payload)")
+    n_bits = int(input("Enter number of LSBs used (1–8): ").strip())
+    x1, y1, x2, y2 = map(int, input("Enter region coordinates x1 y1 x2 y2: ").split())
+    decode(input_file, n_bits, x1, y1, x2, y2)

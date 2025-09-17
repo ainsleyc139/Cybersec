@@ -93,11 +93,11 @@ def compare_images(orig_path, stego_path):
     diff = np.sum(orig != stego)
     return f"Number of pixel values changed: {diff}"
 def hash_key_to_int(key_string):
-    # """Convert alphanumeric key to integer using SHA-256 hash"""
-    # Encode string to bytes, hash it, then convert to integer
+    try:
         hash_bytes = hashlib.sha256(key_string.encode('utf-8')).digest()
-        # Use first 4 bytes and convert to integer (gives us a 32-bit int)
         return int.from_bytes(hash_bytes[:4], byteorder='big')
+    except Exception as e:
+        raise ValueError(f"Invalid key: {e}")
 
 # ---------------- GUI ----------------
 class StegoMainWindow(QMainWindow):
@@ -264,7 +264,36 @@ class StegoMainWindow(QMainWindow):
             )
 
     def load_cover_file(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Select Cover Image", "", "BMP Images (*.bmp)")
+        fname, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Cover File",
+            "",
+            "Supported Files (*.bmp *.png *.gif *.wav *.pcm);;All Files (*.*)"
+        )
+        if not fname:
+            return
+        
+        self.cover_path = fname
+        ext = os.path.splitext(fname)[1].lower()
+
+        if ext in [".bmp", ".png", ".gif"]:
+            # Handle as image
+            pixmap = QPixmap(fname).scaled(280, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.cover_label.setPixmap(pixmap)
+
+            image = cv2.imread(fname)
+            if image is not None:
+                h, w, channel = image.shape
+                print(f"Cover image loaded: {w}x{h}, Channels: {channel}")
+
+        elif ext in [".wav", ".pcm"]:
+            # Handle as audio
+            print(f"Audio file loaded: {fname}")
+            # TODO: Add your audio loading/preview logic here
+
+        else:
+            print("Unsupported file type")
+
         if fname:
             self.cover_path = fname
             pixmap = QPixmap(fname).scaled(280, 280, Qt.KeepAspectRatio, Qt.SmoothTransformation)

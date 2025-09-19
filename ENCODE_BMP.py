@@ -7,11 +7,12 @@ STOP_MARKER = "====="
 
 
 def to_bin(data: bytes) -> str:
+    """Convert bytes into a binary string."""
     return ''.join(format(byte, "08b") for byte in data)
 
 
 def hide_bits(image, data_bits, n_bits, start_xy=(0, 0)):
-    """Write bits sequentially into image starting at start_xy"""
+    """Write bits sequentially into image starting at start_xy."""
     h, w, _ = image.shape
     data_index = 0
     x0, y0 = start_xy
@@ -31,6 +32,7 @@ def hide_bits(image, data_bits, n_bits, start_xy=(0, 0)):
 
 
 def encode(image_name, payload, output_name, n_bits=1, is_file=False, region=None):
+    """Encode text or file into a BMP image using LSB steganography with region + capacity check."""
     image = cv2.imread(image_name)
     if image is None:
         raise FileNotFoundError(f"❌ Could not open {image_name}")
@@ -57,16 +59,23 @@ def encode(image_name, payload, output_name, n_bits=1, is_file=False, region=Non
     header_bits = to_bin(header.encode())
     payload_bits = to_bin(payload_bytes)
 
-    # Capacity check
+    # ✅ Capacity check
     region_capacity = (x2 - x1 + 1) * (y2 - y1 + 1) * 3 * n_bits // 8
-    if len(payload_bytes) > region_capacity:
-        raise ValueError("❌ Payload too large for selected region.")
+    payload_size = len(payload_bytes)
+
+    if payload_size > region_capacity:
+        raise ValueError(
+            f"❌ ERROR: Payload too large for selected region.\n"
+            f"   Payload size: {payload_size} bytes\n"
+            f"   Region capacity: {region_capacity} bytes\n"
+            f"   ➡ Reduce file size, expand region, or use more LSBs."
+        )
 
     print(f"[*] Region capacity: {region_capacity} bytes")
-    print(f"[*] Encoding payload of {len(payload_bytes)} bytes into region ({x1},{y1})–({x2},{y2})")
+    print(f"[*] Encoding payload of {payload_size} bytes into region ({x1},{y1})–({x2},{y2})")
     print(f"[*] Metadata header length: {len(header)} bytes")
 
-    # Step 1: hide header at (0,0) using 1 LSB only
+    # Step 1: hide header at (0,0) using 1-bit LSB only
     hide_bits(image, header_bits, 1, (0, 0))
 
     # Step 2: hide payload in chosen region using user n_bits

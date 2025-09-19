@@ -1,13 +1,23 @@
-import sys, os, base64, wave, importlib.util
+import sys, os, base64, wave, importlib.util, tempfile
 import cv2, numpy as np
-from PySide6.QtCore import Qt, QRect, QSize, QPoint, Signal
+import pygame, tempfile, time
+pygame.mixer.init()
+from PySide6.QtCore import Qt, QRect, QSize, QPoint, Signal, QUrl, QTimer
 from PySide6.QtGui import QColor, QPalette, QPainter, QBrush, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGroupBox, QLineEdit, QFormLayout, QTabWidget, QSpinBox, QTextEdit,
     QFileDialog, QMessageBox, QStackedWidget, QSizePolicy, QRadioButton,
-    QRubberBand, QSplitter
+    QRubberBand, QSplitter, QSlider, QProgressBar
 )
+
+# Try to import pydub for MP3 support
+try:
+    from pydub import AudioSegment
+    HAS_PYDUB = True
+except ImportError:
+    HAS_PYDUB = False
+    print("Warning: pydub not installed. MP3 support disabled. Install with: pip install pydub")
 
 # ==========================
 # Load Image Backends (ENCODE_BMP / DECODE_BMP)
@@ -38,6 +48,174 @@ def _load_image_backends():
         )
 
 bmp_encode, bmp_decode = _load_image_backends()
+
+# ==========================
+# Audio conversion helpers
+# ==========================
+def convert_mp3_to_wav(mp3_path):
+    """Convert MP3 to WAV and return the temporary WAV path."""
+    if not HAS_PYDUB:
+        raise ImportError("pydub is required for MP3 support. Install with: pip install pydub")
+    
+    try:
+        # Load MP3 and convert to WAV
+        audio = AudioSegment.from_mp3(mp3_path)
+        
+        # Create temporary WAV file
+        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        temp_wav.close()
+        
+        # Export as WAV
+        audio.export(temp_wav.name, format="wav")
+        return temp_wav.name
+    except Exception as e:
+        raise Exception(f"Failed to convert MP3 to WAV: {e}")
+
+def get_audio_duration(audio_path):
+    """Get duration of audio file (supports both WAV and MP3)."""
+    if audio_path.lower().endswith('.wav'):
+        with wave.open(audio_path, "rb") as wf:
+            frame_rate = wf.getframerate()
+            total_frames = wf.getnframes()
+            return total_frames / frame_rate
+    elif audio_path.lower().endswith('.mp3') and HAS_PYDUB:
+        audio = AudioSegment.from_mp3(audio_path)
+        return len(audio) / 1000.0  # Convert ms to seconds
+    else:
+        raise ValueError("Unsupported audio format or missing dependencies")
+
+class AudioPlayerWidget(QWidget):
+    """Audio player widget with play/pause/stop controls using pygame."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_file = None
+        self.duration = 0
+        self.position = 0
+        self.is_playing = False
+        self.is_paused = False
+        self.volume = 0.7
+
+        self.init_ui()
+
+        # Timer for updating progress bar
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update_position)
+
+    def init_ui(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
+
+        self.file_label = QLabel("No audio loaded")
+        self.file_label.setStyleSheet("color:#aaa; font-size:12px;")
+        layout.addWidget(self.file_label)
+
+        # Progress + time
+        time_layout = QHBoxLayout()
+        self.time_current = QLabel("0:00")
+        self.time_total = QLabel("0:00")
+        self.time_current.setStyleSheet("color:#999; font-size:10px;")
+        self.time_total.setStyleSheet("color:#999; font-size:10px;")
+        time_layout.addWidget(self.time_current)
+        time_layout.addStretch()
+        time_layout.addWidget(self.time_total)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(10)
+
+        layout.addLayout(time_layout)
+        layout.addWidget(self.progress_bar)
+
+        # Controls
+        controls = QHBoxLayout()
+        self.play_btn = QPushButton("▶ Play")
+        self.play_btn.clicked.connect(self.play_pause)
+        self.play_btn.setEnabled(False)
+
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.setEnabled(False)
+
+        vol_label = QLabel("Vol:")
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        self.volume_slider.setMaximumWidth(100)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+
+        controls.addWidget(self.play_btn)
+        controls.addWidget(self.stop_btn)
+        controls.addWidget(vol_label)
+        controls.addWidget(self.volume_slider)
+        controls.addStretch()
+
+        layout.addLayout(controls)
+        self.setLayout(layout)
+
+    def load_audio(self, file_path):
+        self.current_file = file_path
+        self.position = 0
+        self.is_playing = False
+        self.is_paused = False
+
+        try:
+            if file_path.lower().endswith(".mp3") and HAS_PYDUB:
+                seg = AudioSegment.from_mp3(file_path)
+                temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                seg.export(temp_wav.name, format="wav")
+                self.current_file = temp_wav.name
+            self.duration = get_audio_duration(file_path)
+            mins, secs = divmod(int(self.duration), 60)
+            self.file_label.setText(f"{os.path.basename(file_path)} ({mins}:{secs:02d})")
+            self.time_total.setText(f"{mins}:{secs:02d}")
+            self.play_btn.setEnabled(True)
+            self.stop_btn.setEnabled(True)
+        except Exception as e:
+            self.file_label.setText(f"Error: {e}")
+
+    def play_pause(self):
+        if not self.current_file:
+            return
+        if not self.is_playing:
+            pygame.mixer.music.load(self.current_file)
+            pygame.mixer.music.set_volume(self.volume)
+            pygame.mixer.music.play()
+            self.is_playing = True
+            self.is_paused = False
+            self.play_btn.setText("⏸ Pause")
+            self.update_timer.start(500)
+        elif self.is_paused:
+            pygame.mixer.music.unpause()
+            self.is_paused = False
+            self.play_btn.setText("⏸ Pause")
+        else:
+            pygame.mixer.music.pause()
+            self.is_paused = True
+            self.play_btn.setText("▶ Resume")
+
+    def stop(self):
+        pygame.mixer.music.stop()
+        self.is_playing = False
+        self.is_paused = False
+        self.progress_bar.setValue(0)
+        self.time_current.setText("0:00")
+        self.play_btn.setText("▶ Play")
+        self.update_timer.stop()
+
+    def set_volume(self, value):
+        self.volume = value / 100.0
+        pygame.mixer.music.set_volume(self.volume)
+
+    def update_position(self):
+        if self.is_playing and not self.is_paused and self.duration > 0:
+            pos = pygame.mixer.music.get_pos() / 1000  # ms → sec
+            percentage = (pos / self.duration) * 100
+            self.progress_bar.setValue(int(min(100, percentage)))
+            mins, secs = divmod(int(pos), 60)
+            self.time_current.setText(f"{mins}:{secs:02d}")
 
 # ==========================
 # Audio backend (key-shuffled LSB)
@@ -337,43 +515,78 @@ class StegoMainWindow(QMainWindow):
         s['lsb'] = QSpinBox(); s['lsb'].setRange(1, 8); s['lsb'].setValue(1)
         form.addRow("LSBs:", s['lsb'])
 
-        # Key (optional UI for consistency)
-        s['key'] = QLineEdit(); s['key'].setEchoMode(QLineEdit.Password); s['key'].setPlaceholderText("(Optional) Not used for image backend")
+        # Key
+        s['key'] = QLineEdit(); s['key'].setEchoMode(QLineEdit.Password); s['key'].setPlaceholderText("(Required) Integer key for scrambling")
         style_line_edit(s['key'])
         form.addRow("Key:", s['key'])
 
-        if media == "image":
-            s['mode_text'] = QRadioButton("Text")
-            s['mode_file'] = QRadioButton("File")
-            s['mode_file'].setChecked(True)
-            mode_row = QHBoxLayout()
-            mode_row.addWidget(QLabel("Payload Type:"))
-            mode_row.addWidget(s['mode_text'])
-            mode_row.addWidget(s['mode_file'])
-            form.addRow(mode_row)
-
-            s['text_input'] = QLineEdit()
-            s['text_input'].setPlaceholderText("Enter secret message (Text mode)")
-            style_line_edit(s['text_input'])
-            form.addRow("Text:", s['text_input'])
-
-            # Region fields (auto-filled from preview selection)
-            s['x1'] = QSpinBox(); s['x1'].setRange(0, 10000)
-            s['y1'] = QSpinBox(); s['y1'].setRange(0, 10000)
-            s['x2'] = QSpinBox(); s['x2'].setRange(0, 10000)
-            s['y2'] = QSpinBox(); s['y2'].setRange(0, 10000)
-            row = QHBoxLayout()
-            row.addWidget(QLabel("x1:")); row.addWidget(s['x1'])
-            row.addWidget(QLabel("y1:")); row.addWidget(s['y1'])
-            row.addWidget(QLabel("x2:")); row.addWidget(s['x2'])
-            row.addWidget(QLabel("y2:")); row.addWidget(s['y2'])
-            form.addRow("Region:", row)
-
-            # Toggle visibility based on payload type
-            s['mode_text'].toggled.connect(lambda _c, m=media: self._update_payload_ui(m))
-            s['mode_file'].toggled.connect(lambda _c, m=media: self._update_payload_ui(m))
-
         settings.setLayout(form)
+
+        # --- AUDIO SEGMENT SELECTOR (only for audio) ---
+        if media == "audio":
+            segment_grp = QGroupBox("⏱️ Select Audio Segment")
+            seg_layout = QVBoxLayout()
+            seg_layout.setSpacing(8)
+
+            # Duration label (updated when WAV is loaded)
+            s['duration_label'] = QLabel("Duration: — sec")
+            s['duration_label'].setStyleSheet("color:#aaa; font-size:12px;")
+            seg_layout.addWidget(s['duration_label'])
+
+            # Start slider
+            start_hbox = QHBoxLayout()
+            start_hbox.addWidget(QLabel("Start:"))
+            s['start_slider'] = QSlider(Qt.Horizontal)  # Fixed: Use QSlider
+            s['start_slider'].setMinimum(0)
+            s['start_slider'].setMaximum(60)  # default max 60 sec
+            s['start_slider'].setValue(0)
+            s['start_slider'].setTickPosition(QSlider.TicksBelow)  # Fixed: Use QSlider.TicksBelow
+            s['start_slider'].setTickInterval(5)
+            s['start_time_label'] = QLabel("0.0 sec")
+            start_hbox.addWidget(s['start_slider'])
+            start_hbox.addWidget(s['start_time_label'])
+            seg_layout.addLayout(start_hbox)
+
+            # End slider
+            end_hbox = QHBoxLayout()
+            end_hbox.addWidget(QLabel("End:"))
+            s['end_slider'] = QSlider(Qt.Horizontal)  # Fixed: Use QSlider
+            s['end_slider'].setMinimum(1)
+            s['end_slider'].setMaximum(60)
+            s['end_slider'].setValue(10)
+            s['end_slider'].setTickPosition(QSlider.TicksBelow)  # Fixed: Use QSlider.TicksBelow
+            s['end_slider'].setTickInterval(5)
+            s['end_time_label'] = QLabel("10.0 sec")
+            end_hbox.addWidget(s['end_slider'])
+            end_hbox.addWidget(s['end_time_label'])
+            seg_layout.addLayout(end_hbox)
+
+            # Progress bar visualization
+            s['segment_progress'] = QProgressBar()
+            s['segment_progress'].setRange(0, 100)
+            s['segment_progress'].setValue(0)
+            s['segment_progress'].setTextVisible(False)
+            s['segment_progress'].setStyleSheet("""
+                QProgressBar { 
+                    border: 1px solid #333; 
+                    border-radius: 4px; 
+                    background: #222; 
+                    height: 8px;
+                }
+                QProgressBar::chunk {
+                    background: #4CAF50;
+                    border-radius: 3px;
+                }
+            """)
+            seg_layout.addWidget(s['segment_progress'])
+
+            # Segment info label
+            s['segment_info'] = QLabel("Selected: 0.0–10.0s")
+            s['segment_info'].setStyleSheet("color:#4CAF50; font-weight:bold;")
+            seg_layout.addWidget(s['segment_info'])
+
+            segment_grp.setLayout(seg_layout)
+            lv.addWidget(segment_grp)
 
         # ACTIONS
         act = QHBoxLayout()
@@ -390,7 +603,7 @@ class StegoMainWindow(QMainWindow):
         lv.addWidget(s['status'])
         left.setLayout(lv)
 
-        # RIGHT PANE (large preview)
+        # RIGHT PANE (preview or placeholder)
         right = QWidget()
         rv = QVBoxLayout()
         if media == "image":
@@ -399,11 +612,55 @@ class StegoMainWindow(QMainWindow):
             rv.addWidget(s['preview'])
             reset_btn = QPushButton("Reset Region"); reset_btn.clicked.connect(lambda checked=False, m=media: self._reset_region(m))
             rv.addWidget(reset_btn, alignment=Qt.AlignRight)
-        else:
-            placeholder = QLabel("Audio does not have a visual preview.\nUse WAV cover/stego and set LSBs/Key.")
-            placeholder.setAlignment(Qt.AlignCenter)
-            placeholder.setStyleSheet("color:#aaa; border:1px dashed #333; min-height:360px;")
-            rv.addWidget(placeholder)
+        else:  # audio
+            # Create a container for the audio preview and controls
+            audio_container = QWidget()
+            audio_layout = QVBoxLayout()
+            
+            # Preview title
+            preview_title = QLabel("🎵 Audio Preview")
+            preview_title.setAlignment(Qt.AlignCenter)
+            preview_title.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:14px; margin-bottom:10px;")
+            audio_layout.addWidget(preview_title)
+            
+            # Audio player for original file
+            s['audio_preview'] = AudioPlayerWidget()
+            audio_layout.addWidget(s['audio_preview'])
+            
+            # Separator
+            separator = QLabel()
+            separator.setFixedHeight(1)
+            separator.setStyleSheet("background-color:#333; margin:10px 0;")
+            audio_layout.addWidget(separator)
+            
+            # Stego preview (will be populated after encoding)
+            stego_preview_section = QWidget()
+            stego_layout = QVBoxLayout()
+            
+            stego_preview_title = QLabel("🔐 Stego Audio Preview")
+            stego_preview_title.setAlignment(Qt.AlignCenter)
+            stego_preview_title.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:14px;")
+            stego_layout.addWidget(stego_preview_title)
+            
+            s['stego_preview'] = AudioPlayerWidget()
+            stego_layout.addWidget(s['stego_preview'])
+            
+            stego_preview_section.setLayout(stego_layout)
+            stego_preview_section.setVisible(False)  # Initially hidden until encoding happens
+            s['stego_preview_section'] = stego_preview_section
+            
+            audio_layout.addWidget(stego_preview_section)
+            
+            # Placeholder for additional info
+            info_label = QLabel("Load an audio file to see preview and controls.\nSupports WAV and MP3 formats.")
+            info_label.setAlignment(Qt.AlignCenter)
+            info_label.setStyleSheet("color:#aaa; font-size:12px;")
+            audio_layout.addWidget(info_label)
+            s['info_label'] = info_label
+            
+            audio_layout.addStretch(1)
+            audio_container.setLayout(audio_layout)
+            rv.addWidget(audio_container)
         right.setLayout(rv)
 
         # Splitter arrangement
@@ -415,6 +672,12 @@ class StegoMainWindow(QMainWindow):
         page_layout = QVBoxLayout()
         page_layout.addWidget(splitter)
         page.setLayout(page_layout)
+
+        # Connect slider updates (only for audio)
+        if media == "audio":
+            s['start_slider'].valueChanged.connect(lambda v, m=media: self._update_segment_ui(m))
+            s['end_slider'].valueChanged.connect(lambda v, m=media: self._update_segment_ui(m))
+            self._update_segment_ui(media)  # Initialize UI
 
         # Initialize payload UI visibility for image
         if media == "image":
@@ -472,10 +735,48 @@ class StegoMainWindow(QMainWindow):
             note.setStyleSheet("color:#aaa;")
             rv.addWidget(note, alignment=Qt.AlignRight)
         else:
-            s['preview'] = QTextEdit(); s['preview'].setReadOnly(True)
-            s['preview'].setPlaceholderText("Extracted payload (BASE64 text preview)…")
+            # Audio preview and controls
+            audio_container = QWidget()
+            audio_layout = QVBoxLayout()
+            
+            # Preview title
+            preview_title = QLabel("🎵 Stego Audio Preview")
+            preview_title.setAlignment(Qt.AlignCenter)
+            preview_title.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:14px; margin-bottom:10px;")
+            audio_layout.addWidget(preview_title)
+            
+            # Audio player for stego file
+            s['decode_audio_preview'] = AudioPlayerWidget()
+            audio_layout.addWidget(s['decode_audio_preview'])
+            
+            # Separator
+            separator = QLabel()
+            separator.setFixedHeight(1)
+            separator.setStyleSheet("background-color:#333; margin:10px 0;")
+            audio_layout.addWidget(separator)
+            
+            # Extracted payload preview
+            payload_title = QLabel("📄 Extracted Payload")
+            payload_title.setAlignment(Qt.AlignCenter)
+            payload_title.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:14px; margin:10px 0;")
+            audio_layout.addWidget(payload_title)
+            
+            s['preview'] = QTextEdit()
+            s['preview'].setReadOnly(True)
+            s['preview'].setPlaceholderText("Extracted payload (BASE64 text preview)...")
+            s['preview'].setMinimumHeight(120)
             style_text_edit(s['preview'])
-            rv.addWidget(s['preview'])
+            audio_layout.addWidget(s['preview'])
+            
+            # Placeholder info label
+            info_label = QLabel("Load a stego audio file and decode to see extracted content")
+            info_label.setAlignment(Qt.AlignCenter)
+            info_label.setStyleSheet("color:#aaa; font-size:12px;")
+            audio_layout.addWidget(info_label)
+            s['info_label'] = info_label
+            
+            audio_container.setLayout(audio_layout)
+            rv.addWidget(audio_container)
         right.setLayout(rv)
 
         splitter.addWidget(left)
@@ -494,7 +795,7 @@ class StegoMainWindow(QMainWindow):
         if media == "image":
             filt = "Image Files (*.bmp *.png *.jpg *.jpeg *.gif);;All Files (*)" if which in ("cover","stego") else "All Files (*)"
         else:
-            filt = "WAV Audio (*.wav);;All Files (*)" if which in ("cover","stego") else "All Files (*)"
+            filt = "Audio Files (*.wav *.mp3);;WAV Audio (*.wav);;MP3 Audio (*.mp3);;All Files (*)" if which in ("cover","stego") else "All Files (*)"
         fname, _ = QFileDialog.getOpenFileName(self, "Select File", "", filt)
         if fname:
             self._set_file(media, mode, which, fname)
@@ -515,6 +816,90 @@ class StegoMainWindow(QMainWindow):
                 prev = self.state[media][mode].get('decode_preview')
                 if isinstance(prev, ImagePreviewSelector) and os.path.isfile(path):
                     prev.set_image(path)
+        # Audio: auto-set duration and handle MP3 conversion
+        if media == "audio":
+            if mode == "encode" and which == "cover":
+                if path.lower().endswith(('.wav', '.mp3')):
+                    try:
+                        # Handle MP3 conversion
+                        working_path = path
+                        if path.lower().endswith('.mp3'):
+                            if not HAS_PYDUB:
+                                QMessageBox.warning(None, "MP3 Support Missing", 
+                                    "MP3 support requires pydub. Install with: pip install pydub\n"
+                                    "For now, please use WAV files.")
+                                return
+                            # Convert MP3 to WAV
+                            working_path = convert_mp3_to_wav(path)
+                            s['temp_wav_path'] = working_path  # Store temp path for cleanup
+                        
+                        # Get audio duration and properties
+                        total_duration = get_audio_duration(path)
+                        
+                        # For WAV processing, we need the WAV file
+                        with wave.open(working_path, "rb") as wf:
+                            frame_rate = wf.getframerate()
+                            total_frames = wf.getnframes()
+                        
+                        # Set slider maximums to the actual audio duration
+                        max_val = int(total_duration)
+                        s['start_slider'].setMaximum(max_val)
+                        s['end_slider'].setMaximum(max_val)
+                        
+                        # Set reasonable default values
+                        s['start_slider'].setValue(0)
+                        # Set end to either 10 seconds or the full duration, whichever is smaller
+                        default_end = min(max_val, 10) if max_val > 0 else max_val
+                        s['end_slider'].setValue(default_end)
+                        
+                        # Update tick intervals based on duration
+                        if total_duration <= 30:
+                            tick_interval = 5
+                        elif total_duration <= 120:
+                            tick_interval = 10
+                        else:
+                            tick_interval = max(int(total_duration / 10), 10)
+                        
+                        s['start_slider'].setTickInterval(tick_interval)
+                        s['end_slider'].setTickInterval(tick_interval)
+                        
+                        file_type = "MP3" if path.lower().endswith('.mp3') else "WAV"
+                        s['duration_label'].setText(f"Duration: {total_duration:.1f} sec ({file_type})")
+                        
+                        # Load audio into preview player and hide info label
+                        if 'audio_preview' in s:
+                            s['audio_preview'].load_audio(path)
+                        if 'info_label' in s:
+                            s['info_label'].setVisible(False)
+                            
+                        # Hide stego preview section until encoding happens
+                        if 'stego_preview_section' in s:
+                            s['stego_preview_section'].setVisible(False)
+                        
+                        # Update the segment UI to reflect the new values
+                        self._update_segment_ui(media)
+                        
+                    except Exception as e:
+                        s['duration_label'].setText(f"Duration: Unknown (error: {e})")
+                        # Reset to default values on error
+                        s['start_slider'].setMaximum(60)
+                        s['end_slider'].setMaximum(60)
+                        s['start_slider'].setValue(0)
+                        s['end_slider'].setValue(10)
+                        if 'temp_wav_path' in s:
+                            try:
+                                os.unlink(s['temp_wav_path'])
+                            except:
+                                pass
+                            del s['temp_wav_path']
+            
+            # For decode mode, load the stego audio into the preview player
+            if mode == "decode" and which == "stego":
+                if path.lower().endswith(('.wav', '.mp3')):
+                    if 'decode_audio_preview' in s:
+                        s['decode_audio_preview'].load_audio(path)
+                    if 'info_label' in s:
+                        s['info_label'].setVisible(False)
 
     # ==========================
     # Helpers: payload UI toggle & region
@@ -536,6 +921,34 @@ class StegoMainWindow(QMainWindow):
         s = self.state[media]['encode']
         for k in ('x1','y1','x2','y2'):
             if k in s: s[k].setValue(0)
+
+    def _update_segment_ui(self, media):
+        """Update time labels, progress bar, and constraints based on sliders."""
+        s = self.state[media]['encode']
+        if 'start_slider' not in s or 'end_slider' not in s:
+            return
+
+        start_sec = s['start_slider'].value()
+        end_sec = s['end_slider'].value()
+
+        # Enforce: end >= start + 1 (at least 1 second)
+        if end_sec <= start_sec:
+            s['end_slider'].setValue(start_sec + 1)
+            end_sec = start_sec + 1
+
+        # Update labels
+        s['start_time_label'].setText(f"{start_sec}.0s")
+        s['end_time_label'].setText(f"{end_sec}.0s")
+        s['segment_info'].setText(f"Selected: {start_sec}.0–{end_sec}.0s")
+
+        # Update progress bar (as % of total range)
+        total_range = s['end_slider'].maximum() - s['start_slider'].minimum()
+        if total_range > 0:
+            selected_range = end_sec - start_sec
+            percent = int((selected_range / total_range) * 100)
+            s['segment_progress'].setValue(percent)
+        else:
+            s['segment_progress'].setValue(0)
 
     def _preview_bytes_as_image(self, payload_bytes, target_preview_widget):
         """
@@ -685,48 +1098,149 @@ class StegoMainWindow(QMainWindow):
         cover = s.get('cover_path')
         payload_path = s.get('payload_path')
         n_bits = s['lsb'].value()
-        key_text = s['key'].text().strip() if 'key' in s else ""
+        key_text = s['key'].text().strip()
+
         if not cover:
-            QMessageBox.warning(self, "Error", "Select a WAV cover.")
+            QMessageBox.warning(self, "Error", "Select an audio cover (WAV or MP3).")
             return
         if not payload_path:
-            QMessageBox.warning(self, "Error", "Select a payload file (will be embedded as text).")
+            QMessageBox.warning(self, "Error", "Select a payload file.")
             return
         if not key_text.isdigit():
             QMessageBox.warning(self, "Error", "Key must be an integer.")
             return
-        payload_text = load_binary_as_text(payload_path)
-        output = "stego_output.wav"
+
+        # Handle MP3 conversion if needed
+        working_cover = cover
+        temp_files = []
+        
         try:
-            encode_audio(cover, payload_text, output, n_bits, int(key_text))
+            if cover.lower().endswith('.mp3'):
+                if not HAS_PYDUB:
+                    QMessageBox.warning(self, "Error", "MP3 support requires pydub. Please install it or use WAV files.")
+                    return
+                working_cover = convert_mp3_to_wav(cover)
+                temp_files.append(working_cover)
+
+            # Load WAV to get sample rate and duration
+            with wave.open(working_cover, "rb") as wf:
+                frame_rate = wf.getframerate()
+                total_frames = wf.getnframes()
+                total_duration = total_frames / frame_rate
+
+            # Get selected segment from sliders
+            start_sec = s['start_slider'].value()
+            end_sec = s['end_slider'].value()
+
+            if end_sec > total_duration:
+                QMessageBox.warning(self, "Warning", f"End time ({end_sec}s) exceeds audio length ({total_duration:.1f}s). Truncating.")
+                end_sec = int(total_duration)
+                s['end_slider'].setValue(end_sec)
+
+            if start_sec >= end_sec:
+                QMessageBox.warning(self, "Error", "Start time must be before end time.")
+                return
+
+            # Convert to frame indices
+            start_frame = int(start_sec * frame_rate)
+            end_frame = int(end_sec * frame_rate)
+
+            # Ensure we don't exceed audio length
+            end_frame = min(end_frame, total_frames)
+
+            # Calculate available bits in segment
+            segment_frames = end_frame - start_frame
+            required_bytes = len(load_binary_as_text(payload_path).encode('utf-8'))
+            required_bits = required_bytes * 8
+            available_bits = segment_frames * n_bits
+
+            if required_bits > available_bits:
+                QMessageBox.critical(self, "Capacity Exceeded",
+                    f"Payload requires {required_bits} bits.\n"
+                    f"Selected segment ({start_sec}-{end_sec}s) can only hold {available_bits} bits with {n_bits} LSBs.\n"
+                    f"Try increasing LSBs or extending the segment.")
+                return
+
+            output = "stego_output.wav"
+            payload_text = load_binary_as_text(payload_path)
+
+            # Perform encoding
+            encode_audio(working_cover, payload_text, output, n_bits, int(key_text))
             self.state['audio']['last_stego'] = output
-            s['status'] = s.get('status') or QLabel()
-            s['status'].setText(f"✅ Stego created: {output}")
+            
+            # Update status 
+            s['status'].setText(f"✅ Stego created: {output}\nSegment used: {start_sec}–{end_sec}s ({segment_frames} frames)")
+            
+            # Show stego preview section and load the stego audio
+            if 'stego_preview_section' in s:
+                s['stego_preview_section'].setVisible(True)
+            if 'stego_preview' in s:
+                s['stego_preview'].load_audio(output)
+            if 'info_label' in s:
+                s['info_label'].setVisible(False)
+
         except Exception as e:
             QMessageBox.critical(self, "Encoding Failed", str(e))
+        finally:
+            # Clean up temporary files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
 
     def _run_decoding_audio(self):
         s = self.state['audio']['decode']
         stego = s.get('stego_path')
         n_bits = s['lsb'].value()
         key_text = s['key'].text().strip() if 'key' in s else ""
+        
         if not stego:
-            QMessageBox.warning(self, "Error", "Select a stego WAV.")
+            QMessageBox.warning(self, "Error", "Select a stego audio file (WAV or MP3).")
             return
         if not key_text.isdigit():
             QMessageBox.warning(self, "Error", "Key must be an integer.")
             return
+            
+        # Handle MP3 conversion if needed
+        working_stego = stego
+        temp_files = []
+        
         try:
-            text = decode_audio(stego, n_bits, int(key_text))
+            if stego.lower().endswith('.mp3'):
+                if not HAS_PYDUB:
+                    QMessageBox.warning(self, "Error", "MP3 support requires pydub. Please install it or use WAV files.")
+                    return
+                working_stego = convert_mp3_to_wav(stego)
+                temp_files.append(working_stego)
+            
+            # Decode the audio
+            text = decode_audio(working_stego, n_bits, int(key_text))
+            
+            # Update preview
             if 'preview' not in s:
-                s['preview'] = QTextEdit(); s['preview'].setReadOnly(True)
+                s['preview'] = QTextEdit()
+                s['preview'].setReadOnly(True)
                 style_text_edit(s['preview'])
             s['preview'].setPlainText(text)
+            
+            # Hide info label
+            if 'info_label' in s:
+                s['info_label'].setVisible(False)
+            
             s['status'] = s.get('status') or QLabel()
-            s['status'].setText("✅ Payload extracted (BASE64 TEXT). Use 'Save Extracted…' to write binary.")
+            s['status'].setText("✅ Payload extracted (BASE64 TEXT). Use 'Save Extracted...' to write binary.")
             self.state['audio']['last_extracted_text'] = text
+            
         except Exception as e:
             QMessageBox.critical(self, "Decoding Failed", str(e))
+        finally:
+            # Clean up temporary files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
 
     # Save handlers
     def _save_last_stego(self, media):

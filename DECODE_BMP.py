@@ -5,7 +5,7 @@ START_MARKER = "<<<START>>>"
 STOP_MARKER = "====="
 
 
-def decode(image_name):
+def decode(image_name, user_n_bits):
     image = cv2.imread(image_name)
     if image is None:
         raise FileNotFoundError(f"❌ Could not open {image_name}")
@@ -18,7 +18,7 @@ def decode(image_name):
         for x in range(w):
             pixel = image[y, x]
             for channel in range(3):
-                binary_data += format(pixel[channel], "08b")[-1:]  # always 1 bit
+                binary_data += format(pixel[channel], "08b")[-1:]  # always 1 bit for header
                 while len(binary_data) >= 8:
                     byte = binary_data[:8]
                     binary_data = binary_data[8:]
@@ -28,11 +28,11 @@ def decode(image_name):
                         decoded_data = decoded_data[:-len(STOP_MARKER)]
                         if START_MARKER in decoded_data:
                             header_str = decoded_data.split(START_MARKER, 1)[1]
-                            return parse_and_extract(header_str, image)
+                            return parse_and_extract(header_str, image, user_n_bits)
     raise ValueError("❌ No hidden data found.")
 
 
-def parse_and_extract(header_str, image):
+def parse_and_extract(header_str, image, user_n_bits):
     parts = header_str.split(";")
     meta = {}
     for p in parts:
@@ -45,7 +45,11 @@ def parse_and_extract(header_str, image):
 
     x1, y1, x2, y2 = map(int, meta["REGION"].split(","))
     size = int(meta["SIZE"])
-    n_bits = int(meta["LSB"])
+    true_n_bits = int(meta["LSB"])
+
+    # ✅ Only show generic error, don’t reveal correct LSB
+    if user_n_bits != true_n_bits:
+        raise ValueError("❌ Wrong LSB used. Decoding failed.")
 
     if "FILE" in meta:
         filename = meta["FILE"]
@@ -54,9 +58,9 @@ def parse_and_extract(header_str, image):
         filename = None
         payload_type = "TEXT"
 
-    print(f"[*] Found header: region=({x1},{y1},{x2},{y2}), lsb={n_bits}, size={size}")
+    print(f"[*] Found header: region=({x1},{y1},{x2},{y2}), lsb={true_n_bits}, size={size}")
 
-    return extract_payload(image, x1, y1, x2, y2, n_bits, size, payload_type, filename)
+    return extract_payload(image, x1, y1, x2, y2, true_n_bits, size, payload_type, filename)
 
 
 def extract_payload(image, x1, y1, x2, y2, n_bits, size, payload_type, filename):
@@ -95,4 +99,15 @@ if __name__ == "__main__":
     input_file = input("Enter stego BMP filename: ").strip()
     if not input_file.lower().endswith(".bmp"):
         input_file += ".bmp"
-    decode(input_file)
+
+    while True:
+        try:
+            user_n_bits = int(input("Enter number of LSBs used (1–8): ").strip())
+            if 1 <= user_n_bits <= 8:
+                break
+            else:
+                print("⚠️ Please enter a number between 1 and 8.")
+        except ValueError:
+            print("⚠️ Invalid input. Enter a number between 1 and 8.")
+
+    decode(input_file, user_n_bits)

@@ -1115,9 +1115,7 @@ class StegoMainWindow(QMainWindow):
         if not payload_path:
             QMessageBox.warning(self, "Error", "Select a payload file.")
             return
-        if not key_text.isdigit():
-            QMessageBox.warning(self, "Error", "Key must be an integer.")
-            return
+
 
         # Handle MP3 conversion if needed
         working_cover = cover
@@ -1207,9 +1205,7 @@ class StegoMainWindow(QMainWindow):
         if not stego:
             QMessageBox.warning(self, "Error", "Select a stego audio file (WAV or MP3).")
             return
-        if not key_text.isdigit():
-            QMessageBox.warning(self, "Error", "Key must be an integer.")
-            return
+
             
         # Handle MP3 conversion if needed
         working_stego = stego

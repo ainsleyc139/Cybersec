@@ -1,10 +1,17 @@
 import cv2
 import numpy as np
 import os
+import hashlib
+
 
 START_MARKER = "<<<START>>>"
 STOP_MARKER = "====="
 
+def hash_to_seed(key_text: str) -> int:
+    if not isinstance(key_text, str) or not key_text.strip():
+        raise ValueError("Key/passphrase is required.")
+    # 64-bit seed from SHA-256 (works with NumPy PCG64 etc.)
+    return int.from_bytes(hashlib.sha256(key_text.encode("utf-8")).digest()[:8], "little", signed=False)
 
 def to_bin(data: bytes) -> str:
     """Convert bytes into a binary string."""
@@ -31,20 +38,27 @@ def hide_bits(image, data_bits, n_bits, start_xy=(0, 0)):
     return
 
 
-def encode(image_name, payload, output_name, n_bits=1, is_file=False, region=None):
+def encode(image_name, payload,key_text:str, output_name, n_bits=1, is_file=False, region=None):
     """Encode text or file into a BMP image using LSB steganography with region + capacity check."""
     image = cv2.imread(image_name)
     if image is None:
         raise FileNotFoundError(f"❌ Could not open {image_name}")
+    if not isinstance(key_text, str) or key_text.strip() == "":
+        raise ValueError("Key/passphrase is required for encoding (image).")
+
+    seed = hash_to_seed(key_text)
 
     h, w, _ = image.shape
 
     # Default region = whole image
     if region is None or len(region) != 4:
-        x1, y1, x2, y2 = 0, 0, w - 1, h - 1
+            x1, y1, x2, y2 = 0, 0, w - 1, h - 1
     else:
         x1, y1, x2, y2 = region
-
+        x1, x2 = max(0, min(x1, w - 1)), max(0, min(x2, w - 1))
+        y1, y2 = max(0, min(y1, h - 1)), max(0, min(y2, h - 1))
+        if x1 > x2 or y1 > y2:
+            raise ValueError("❌ Invalid region: ensure x1<=x2 and y1<=y2 within image bounds.")
     # Prepare payload
     if is_file:
         with open(payload, "rb") as f:
@@ -60,6 +74,11 @@ def encode(image_name, payload, output_name, n_bits=1, is_file=False, region=Non
     payload_bits = to_bin(payload_bytes)
 
     # ✅ Capacity check
+
+    total_image_bits_at_1lsb = w * h * 3
+    if len(header_bits) > total_image_bits_at_1lsb:
+        raise ValueError("❌ Header too large for the image at 1-bit LSB.")
+    
     region_capacity = (x2 - x1 + 1) * (y2 - y1 + 1) * 3 * n_bits // 8
     payload_size = len(payload_bytes)
 
@@ -79,21 +98,28 @@ def encode(image_name, payload, output_name, n_bits=1, is_file=False, region=Non
     hide_bits(image, header_bits, 1, (0, 0))
 
     # Step 2: hide payload in chosen region using user n_bits
-    data_index = 0
+    order = []
     for y in range(y1, y2 + 1):
         for x in range(x1, x2 + 1):
-            pixel = image[y, x]
-            for channel in range(3):
-                if data_index < len(payload_bits):
-                    mask = ~((1 << n_bits) - 1) & 0xFF
-                    bits = int(payload_bits[data_index:data_index + n_bits].ljust(n_bits, '0'), 2)
-                    pixel[channel] = np.uint8((int(pixel[channel]) & mask) | bits)
-                    data_index += n_bits
-            if data_index >= len(payload_bits):
-                break
+            order.append((y, x, 0))  # B
+            order.append((y, x, 1))  # G
+            order.append((y, x, 2))  # R
+
+    # (C) shuffle deterministically using the seed
+    rng = np.random.Generator(np.random.PCG64(seed))
+    rng.shuffle(order)
+
+    # (D) embed payload bits following the shuffled order with user-selected n_bits
+    data_index = 0
+    mask = ~((1 << n_bits) - 1) & 0xFF
+    for (yy, xx, ch) in order:
         if data_index >= len(payload_bits):
             break
+        bits = int(payload_bits[data_index:data_index + n_bits].ljust(n_bits, '0'), 2)
+        image[yy, xx, ch] = np.uint8((int(image[yy, xx, ch]) & mask) | bits)
+        data_index += n_bits
 
+    # ✅ write once here
     cv2.imwrite(output_name, image)
     print(f"[+] Data encoded successfully into {output_name}")
 
@@ -103,6 +129,10 @@ if __name__ == "__main__":
     input_file = input("Enter input BMP filename: ").strip()
     if not input_file.lower().endswith(".bmp"):
         input_file += ".bmp"
+
+    key_text = input("Enter key/passphrase: ").strip()
+    if not key_text:
+        raise ValueError("❌ Key/passphrase cannot be empty.")
 
     mode = input("Hide Text or File? (T/F): ").strip().upper()
     if mode == "F":
@@ -130,4 +160,7 @@ if __name__ == "__main__":
     region = tuple(map(int, region_input.split())) if region_input else None
 
     output_file = "encoded_output.bmp"
-    encode(input_file, payload, output_file, n_bits, is_file, region)
+    if not output_file.lower().endswith(".bmp"):
+        output_file += ".bmp"
+
+    encode(input_file, payload, key_text, output_file, n_bits, is_file, region)

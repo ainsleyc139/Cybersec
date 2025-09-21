@@ -998,6 +998,10 @@ class StegoMainWindow(QMainWindow):
         cover = s.get('cover_path')
         payload_path = s.get('payload_path')
         n_bits = s['lsb'].value()
+        key_text = s['key'].text().strip()
+        if not key_text:
+            QMessageBox.warning(self, "Missing key", "Key/passphrase is required for encoding.")
+            return
 
         if not cover:
             QMessageBox.warning(self, "Error", "Select a cover image (BMP/PNG/JPG/GIF).")
@@ -1032,7 +1036,8 @@ class StegoMainWindow(QMainWindow):
                 output_name=output,
                 n_bits=n_bits,
                 is_file=is_file,
-                region=region
+                region=region,
+                key_text=key_text
             )
             self.state['image']['last_stego'] = output
             s['status'].setText(f"✅ Stego created: {output}")
@@ -1048,8 +1053,12 @@ class StegoMainWindow(QMainWindow):
         if not stego:
             QMessageBox.warning(self, "Error", "Select a stego image (BMP).")
             return
+        key_text = s['key'].text().strip()
+        if not key_text:
+            QMessageBox.warning(self, "Missing key", "Key/passphrase is required for decoding.")
+            return
         try:
-            payload_bytes = bmp_decode(stego)  # auto-detects region/lsb & may save decoded_<filename>
+            payload_bytes = bmp_decode(stego,key_text=key_text)  # auto-detects region/lsb & may save decoded_<filename>
             self.state['image']['last_extracted_bytes'] = payload_bytes
 
             # 1) Try to preview bytes as an image (PNG/JPG/GIF/BMP)

@@ -38,8 +38,7 @@ def encode_audio_with_key(file_name, is_file, secret_data_file, output_name,
 
     binary_secret_data = get_payload(secret_data_file, is_file)
 
-    # Optional: include LSB in your header for verification during decode
-    # (If you do this, add ;lsb:{n_bits} to your header inside get_payload)
+
 
     # Pad to multiple of n_bits
     rem = len(binary_secret_data) % n_bits

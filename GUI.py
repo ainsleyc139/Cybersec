@@ -287,6 +287,22 @@ def style_line_edit(le: QLineEdit):
 
 def style_text_edit(te: QTextEdit):
     te.setStyleSheet("QTextEdit { color:#fff; background:#222; border:1px solid #444; }")
+def _mask_key_display(k: str, keep_tail: int = 4) -> str:
+    k = (k or "").strip()
+    if not k: return "(empty)"
+    if len(k) <= keep_tail:
+        return "•" * (len(k) - 1) + k[-1]
+    return "•" * (len(k) - keep_tail) + k[-keep_tail:]
+
+def _fmt_bytes(n: int) -> str:
+    n = int(n)
+    units = ["B","KB","MB","GB","TB"]
+    i = 0
+    while n >= 1024 and i < len(units)-1:
+        n /= 1024.0
+        i += 1
+    return f"{n:.1f} {units[i]}" if i else f"{int(n)} {units[i]}"
+
 
 # ==========================
 # UI widgets
@@ -475,6 +491,31 @@ class StegoMainWindow(QMainWindow):
 
         v.addWidget(stack)
         parent_widget.setLayout(v)
+
+    def _show_encode_summary(self, *, media: str, cover: str, output: str,
+                         payload_label: str, payload_size: int,
+                         n_bits: int, key_text: str,
+                         extra_lines: list[str] | None = None):
+        lines = [
+            f"<b>Media:</b> {media}",
+            f"<b>Cover:</b> {os.path.basename(cover)}",
+            f"<b>Output:</b> {os.path.basename(output)}",
+            f"<b>Payload:</b> {payload_label}",
+            f"<b>Payload Size:</b> {_fmt_bytes(payload_size)}",
+            f"<b>LSBs Used:</b> {n_bits}",
+            f"<b>Key (masked):</b> {_mask_key_display(key_text)}",
+        ]
+        if extra_lines:
+            lines += extra_lines
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Encoding Summary")
+        box.setIcon(QMessageBox.Information)
+        box.setText("✅ Encoding completed")
+        box.setInformativeText("<br>".join(lines))
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+
 
     # --- Encode page ---
     def build_encode_page(self, page: QWidget, media: str):
@@ -998,6 +1039,10 @@ class StegoMainWindow(QMainWindow):
         cover = s.get('cover_path')
         payload_path = s.get('payload_path')
         n_bits = s['lsb'].value()
+        key_text = s['key'].text().strip()
+        if not key_text:
+            QMessageBox.warning(self, "Missing key", "Key/passphrase is required for encoding.")
+            return
 
         if not cover:
             QMessageBox.warning(self, "Error", "Select a cover image (BMP/PNG/JPG/GIF).")
@@ -1032,13 +1077,52 @@ class StegoMainWindow(QMainWindow):
                 output_name=output,
                 n_bits=n_bits,
                 is_file=is_file,
-                region=region
+                region=region,
+                key_text=key_text
             )
             self.state['image']['last_stego'] = output
             s['status'].setText(f"✅ Stego created: {output}")
             prev = s.get('preview')
             if isinstance(prev, ImagePreviewSelector) and os.path.exists(output):
                 prev.set_image(output)
+            # after setting preview/status
+# Build payload label/size for summary
+            if is_file:
+                payload_size = os.path.getsize(payload_arg)
+                payload_label = os.path.basename(payload_arg)
+            else:
+                payload_bytes = payload_arg.encode("utf-8")
+                payload_size = len(payload_bytes)
+                payload_label = f"(Text) {payload_arg[:40] + ('…' if len(payload_arg) > 40 else '')}"
+
+            # Optional: show estimated region capacity (display only)
+            extra = []
+            try:
+                img0 = cv2.imread(cover, cv2.IMREAD_COLOR)
+                if img0 is not None:
+                    h, w, _ = img0.shape
+                    if region is None:
+                        x1=y1=0; x2=w-1; y2=h-1
+                    else:
+                        x1,y1,x2,y2 = region
+                    pixels = (x2-x1+1)*(y2-y1+1)
+                    est_capacity_bytes = (pixels*3*n_bits)//8
+                    extra.append(f"<b>Region:</b> ({x1},{y1})–({x2},{y2})")
+                    extra.append(f"<b>Est. Capacity:</b> {_fmt_bytes(est_capacity_bytes)}")
+            except Exception:
+                pass
+
+            self._show_encode_summary(
+                media="image",
+                cover=cover,
+                output=output,
+                payload_label=payload_label,
+                payload_size=payload_size,
+                n_bits=n_bits,
+                key_text=key_text,
+                extra_lines=extra
+            )
+
         except Exception as e:
             QMessageBox.critical(self, "Encoding Failed", str(e))
 
@@ -1048,8 +1132,12 @@ class StegoMainWindow(QMainWindow):
         if not stego:
             QMessageBox.warning(self, "Error", "Select a stego image (BMP).")
             return
+        key_text = s['key'].text().strip()
+        if not key_text:
+            QMessageBox.warning(self, "Missing key", "Key/passphrase is required for decoding.")
+            return
         try:
-            payload_bytes = bmp_decode(stego)  # auto-detects region/lsb & may save decoded_<filename>
+            payload_bytes = bmp_decode(stego,key_text=key_text)  # auto-detects region/lsb & may save decoded_<filename>
             self.state['image']['last_extracted_bytes'] = payload_bytes
 
             # 1) Try to preview bytes as an image (PNG/JPG/GIF/BMP)
@@ -1106,9 +1194,7 @@ class StegoMainWindow(QMainWindow):
         if not payload_path:
             QMessageBox.warning(self, "Error", "Select a payload file.")
             return
-        if not key_text.isdigit():
-            QMessageBox.warning(self, "Error", "Key must be an integer.")
-            return
+
 
         # Handle MP3 conversion if needed
         working_cover = cover
@@ -1178,6 +1264,31 @@ class StegoMainWindow(QMainWindow):
                 s['stego_preview'].load_audio(output)
             if 'info_label' in s:
                 s['info_label'].setVisible(False)
+            # ---- Post-encode summary popup (audio) ----
+            orig_payload_size = os.path.getsize(payload_path)
+            embedded_size = len(payload_text.encode("utf-8"))  # base64 size actually embedded
+            available_bytes = (available_bits // 8)
+            overhead = embedded_size - orig_payload_size
+
+            extra = [
+                f"<b>Segment:</b> {start_sec}s – {end_sec}s",
+                f"<b>Segment Capacity:</b> {_fmt_bytes(available_bytes)} ({available_bits} bits @ {n_bits} LSBs)",
+                f"<b>Original File Size:</b> {_fmt_bytes(orig_payload_size)}",
+                f"<b>Embedded (Base64) Size:</b> {_fmt_bytes(embedded_size)}",
+                f"<b>Base64 Overhead:</b> {'+' if overhead >= 0 else ''}{_fmt_bytes(overhead)}",
+            ]
+
+            self._show_encode_summary(
+                media="audio",
+                cover=cover,
+                output=output,
+                payload_label=os.path.basename(payload_path),
+                payload_size=embedded_size,
+                n_bits=n_bits,
+                key_text=key_text,
+                extra_lines=extra
+            )
+
 
         except Exception as e:
             QMessageBox.critical(self, "Encoding Failed", str(e))
@@ -1198,9 +1309,7 @@ class StegoMainWindow(QMainWindow):
         if not stego:
             QMessageBox.warning(self, "Error", "Select a stego audio file (WAV or MP3).")
             return
-        if not key_text.isdigit():
-            QMessageBox.warning(self, "Error", "Key must be an integer.")
-            return
+
             
         # Handle MP3 conversion if needed
         working_stego = stego

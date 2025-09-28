@@ -1,6 +1,9 @@
 import sys, os, base64, wave, importlib.util, tempfile
 import cv2, numpy as np
 import pygame, tempfile, time
+import hashlib
+from encode_audio import encode_audio
+from decode_audio import decode_audio
 pygame.mixer.init()
 from PySide6.QtCore import Qt, QRect, QSize, QPoint, Signal, QUrl, QTimer
 from PySide6.QtGui import QColor, QPalette, QPainter, QBrush, QPixmap, QImage
@@ -218,58 +221,342 @@ class AudioPlayerWidget(QWidget):
             self.time_current.setText(f"{mins}:{secs:02d}")
 
 # ==========================
-# Audio backend (key-shuffled LSB)
+# Audio backend (integrated from encode_audio.py and decode_audio.py)
 # ==========================
-STOP_MARKER = b"====="
 
-def generate_coords(length, key: int):
-    coords = list(range(length))
-    rng = np.random.RandomState(int(key))
-    rng.shuffle(coords)
-    return coords
+def to_bin(data):
+    """Convert data into binary format as string"""
+    if isinstance(data, str):
+        return ''.join([format(ord(i), "08b") for i in data])
+    elif isinstance(data, bytes) or isinstance(data, np.ndarray):
+        return [format(int(i), "08b") for i in data]
+    elif isinstance(data, (int, np.integer)):
+        return format(int(data), "08b")
+    else:
+        raise TypeError(f"Type not supported: {type(data)}")
 
+def to_float_or_none(x):
+    if x is None: return None
+    s = str(x).strip()
+    if s == "": return None
+    return float(s)
+
+def hash_to_seed(key_text: str) -> int:
+    """Convert key text to seed for PRNG"""
+    if not isinstance(key_text, str) or not key_text.strip():
+        raise ValueError("Key/passphrase is required.")
+    return int.from_bytes(hashlib.sha256(key_text.encode("utf-8")).digest()[:8], "little", signed=False)
+
+def get_payload(file_path, is_file):
+    """Prepare payload with header information"""
+    if is_file:  # Read file as binary
+        with open(file_path, "rb") as f:
+            byte_data = f.read()
+        # End marker 
+        end_bin = to_bin("=====")
+        # Get the file extension (e.g., '.txt')
+        extension = file_path.split('.')[-1]
+        header_marker = f"<type:{extension};size:{len(byte_data)}>"
+        # Convert header and file content to binary
+        header_bin = ''.join(to_bin(c) for c in header_marker)
+        content_bin = ''.join(to_bin(byte) for byte in byte_data)
+    else: 
+        # header with 'nil' filetype for when decoding 
+        header_marker = f"<type:nil;size:0>"
+        # Convert header and file content to binary
+        header_bin = ''.join(to_bin(ord(c)) for c in header_marker)
+        content_bin = to_bin(file_path)
+        end_bin = to_bin("=====")
+    return header_bin + content_bin + end_bin
+
+def decode_audio_header(binary_data):
+    """Decode header from binary data"""
+    header_data = ""
+    for i in range(0, len(binary_data), 8):
+        byte = binary_data[i:i+8]
+        char = chr(int(byte, 2))
+        header_data += char
+        if char == '>':
+            break
+    header_length = len(header_data) * 8
+    return header_data, header_length
+
+def encode_audio_with_key(file_name, is_file, secret_data_file, output_name, key, n_bits=1, start_time=None, end_time=None):
+    """Encode audio with key-based shuffling"""
+    n_bits = int(n_bits)
+    with wave.open(file_name, "rb") as audio:
+        params = audio.getparams()
+        sample_rate = audio.getframerate()
+        sample_width = audio.getsampwidth()
+        num_channels = audio.getnchannels()
+        frames = bytearray(audio.readframes(audio.getnframes()))
+    
+    frame_size = num_channels * sample_width
+    total_bytes = len(frames)
+    max_bits = total_bytes * n_bits
+
+    # convert user input times to float or none
+    start_time = to_float_or_none(start_time)
+    end_time = to_float_or_none(end_time)
+
+    # convert time into frames, then into bytes
+    if start_time is not None and end_time is not None:
+        start_frame = int(start_time * sample_rate)
+        end_frame = int(end_time * sample_rate)
+        # calculate start and end byte
+        start_byte = start_frame * frame_size
+        end_byte = end_frame * frame_size
+        if end_byte > total_bytes:
+            raise ValueError("[!] End time exceeds file length")
+        max_bits = (end_byte - start_byte) * n_bits
+    else:
+        start_byte = 0
+        end_byte = total_bytes
+            
+    # read payload file to get payload (binary)
+    binary_secret_data = get_payload(secret_data_file, is_file)
+    
+    while len(binary_secret_data) % n_bits != 0:
+        binary_secret_data += '0'
+
+    data_len = len(binary_secret_data)
+
+    if data_len > max_bits:
+        raise ValueError("[!] Insufficient bytes, need bigger audio or fewer bits per channel.")
+
+    # Split the secret data into chunks of n_bits length so we can shuffle it with key
+    bits_chunks = []
+    for i in range(0, data_len, n_bits):
+        bits_chunks.append(binary_secret_data[i:i+n_bits])
+    
+    # Build shuffled order using PRNG/seed
+    order = np.arange(start_byte, end_byte, dtype=np.int64)
+    seed = hash_to_seed(key)
+    rng = np.random.Generator(np.random.PCG64(seed))
+    rng.shuffle(order)
+
+    # pad the length to match the end time so that we can decode it later
+    while len(bits_chunks) < len(order):
+        bits_chunks.append('0' * n_bits)
+
+    # Use shuffled order to encode
+    for i, pos in enumerate(order):
+        bits_value = int(bits_chunks[i], 2)
+        # Clear the LSBs and insert new bits
+        mask = ~((1 << n_bits) - 1) & 0xFF
+        frames[pos] = (frames[pos] & mask) | bits_value
+
+    # Save modified audio 
+    with wave.open(output_name, "wb") as output:
+        output.setparams(params)
+        output.writeframes(frames)
+def decode_audio_with_key(file_name, key, start_time=None, end_time=None, n_bits=1):
+    """Decode audio with key-based shuffling.
+    If start_time or end_time are not given, decode the entire file automatically.
+    """
+    import wave, base64, numpy as np
+
+    n_bits = int(n_bits)
+    with wave.open(file_name, "rb") as audio:
+        sample_rate = audio.getframerate()
+        sample_width = audio.getsampwidth()
+        num_channels = audio.getnchannels()
+        frames = bytearray(audio.readframes(audio.getnframes()))
+
+    if frames is None:
+        raise FileNotFoundError(f"❌ Could not open {file_name}. Check path and extension.")
+
+    frame_size = num_channels * sample_width
+    total_bytes = len(frames)
+
+    # --- Handle time range ---
+    if start_time is None or end_time is None:
+        # Default: use full audio
+        start_byte = 0
+        end_byte = total_bytes
+        max_bits = (end_byte - start_byte) * n_bits
+    else:
+        start_frame = int(float(start_time) * sample_rate)
+        end_frame = int(float(end_time) * sample_rate)
+        start_byte = start_frame * frame_size
+        end_byte = end_frame * frame_size
+        if end_byte > total_bytes:
+            raise ValueError("[!] End time exceeds file length")
+        max_bits = (end_byte - start_byte) * n_bits
+
+    # --- Build shuffled order with same seed ---
+    from hashlib import sha256
+    def hash_to_seed(key_text: str) -> int:
+        if not isinstance(key_text, str) or not key_text.strip():
+            raise ValueError("Key/passphrase is required.")
+        return int.from_bytes(sha256(key_text.encode("utf-8")).digest()[:8], "little")
+
+    order = np.arange(start_byte, end_byte, dtype=np.int64)
+    seed = hash_to_seed(key)
+    rng = np.random.Generator(np.random.PCG64(seed))
+    rng.shuffle(order)
+
+    # --- Collect bits ---
+    bits_buffer = []
+    for pos in order:
+        bits = frames[pos] & ((1 << n_bits) - 1)
+        bits_buffer.append(f'{bits:0{n_bits}b}')
+
+    binary_data = ''.join(bits_buffer)
+
+    # --- Look for header ---
+    marker = "<type:"
+    binary_marker = ''.join([format(ord(c), "08b") for c in marker])
+
+    header_start = binary_data.find(binary_marker)
+    if header_start == -1:
+        raise ValueError("❌ Header marker not found in decoded data")
+
+    # Decode header string until ">"
+    header_bits = binary_data[header_start:]
+    header_data = ""
+    for i in range(0, len(header_bits), 8):
+        byte = header_bits[i:i+8]
+        if len(byte) < 8:
+            break
+        char = chr(int(byte, 2))
+        header_data += char
+        if char == ">":
+            break
+
+    header_parts = header_data.strip("<>").split(';')
+    payload_extension = '.' + header_parts[0][5:]
+    payload_size = int(header_parts[1][5:])
+
+    # --- Extract payload ---
+    start_idx = header_start + len(header_data) * 8
+    if payload_extension == ".nil":
+        # Text payload
+        payload_bits = binary_data[start_idx:]
+        decoded_text = ""
+        for i in range(0, len(payload_bits), 8):
+            byte = payload_bits[i:i+8]
+            if len(byte) < 8:
+                break
+            decoded_text += chr(int(byte, 2))
+        decoded_text = decoded_text.removesuffix("=====")
+        return decoded_text
+    else:
+        # File payload
+        file_bits = binary_data[start_idx:start_idx + payload_size * 8]
+        file_bytes = bytearray(int(file_bits[i:i+8], 2) for i in range(0, len(file_bits), 8))
+        return base64.b64encode(file_bytes).decode("utf-8")
+
+# def decode_audio_with_key(file_name, key, start_time, end_time, n_bits=1):
+#     """Decode audio with key-based shuffling"""
+#     n_bits = int(n_bits)
+#     with wave.open(file_name, "rb") as audio:
+#         sample_rate = audio.getframerate()
+#         sample_width = audio.getsampwidth()
+#         num_channels = audio.getnchannels()
+#         frames = bytearray(audio.readframes(audio.getnframes()))
+
+#     if frames is None:
+#         raise FileNotFoundError(f"Could not open {file_name}. Check path and extension.")
+    
+#     frame_size = num_channels * sample_width
+#     total_bytes = len(frames)
+    
+#     # convert user input time
+#     start_time = to_float_or_none(start_time)
+#     end_time = to_float_or_none(end_time)
+
+#     # convert time into frames, then into bytes
+#     if start_time is not None and end_time is not None:
+#         start_frame = int(start_time * sample_rate)
+#         end_frame = int(end_time * sample_rate)
+#         # calculate start and end byte
+#         start_byte = start_frame * frame_size
+#         end_byte = end_frame * frame_size
+#         if end_byte > total_bytes:
+#             raise ValueError("[!] End time exceeds file length")
+#         max_bits = (end_byte - start_byte) * n_bits
+#     else:
+#         raise ValueError("[!] start and end times must be entered")
+
+#     # Build shuffled order using same PRNG/seed as encoder
+#     order = np.arange(start_byte, end_byte, dtype=np.int64)
+#     seed = hash_to_seed(key)
+#     rng = np.random.Generator(np.random.PCG64(seed))
+#     rng.shuffle(order)
+
+#     bits_buffer = []
+#     for pos in order:
+#         bits = frames[pos] & ((1 << n_bits) - 1)
+#         bits_buffer.append(f'{bits:0{n_bits}b}')
+    
+#     binary_data = ''.join(bits_buffer)
+    
+#     # front of header as a marker to find it
+#     marker = "<type:" 
+#     binary_header_marker = to_bin(marker)
+
+#     decoded_data = ""
+
+#     # search for the header in the binary data by finding the marker
+#     header_start = binary_data.find(binary_header_marker)
+    
+#     if header_start == -1:
+#         raise ValueError("Header marker not found in decoded data")
+
+#     # decode the header data '<type: ;size: >'
+#     header_data, header_length = decode_audio_header(binary_data[header_start:])
+#     header_parts = header_data.strip("<>").split(';')
+#     payload_extension = '.' + header_parts[0][5:]
+#     payload_size = int(header_parts[1][5:])
+    
+#     # If the payload is not a file, extension is put as .nil when encoding
+#     if payload_extension == ".nil":
+#         payload_data = binary_data[header_start + header_length:]
+#         while len(payload_data) >= 8:
+#             byte_data = payload_data[:8]
+#             payload_data = payload_data[8:]
+#             decoded_data += chr(int(byte_data, 2))
+#         decoded_data = decoded_data.removesuffix("=====")
+#         return decoded_data
+#     else:
+#         # decode payload for files - return the binary data instead of saving directly
+#         header_length = header_start + header_length
+#         file_bits = binary_data[header_length:header_length + payload_size * 8]
+#         file_bytes = bytearray(int(file_bits[i:i+8], 2) for i in range(0, len(file_bits), 8))
+#         return base64.b64encode(file_bytes).decode('utf-8')  # Return as base64 for consistency with GUI
+
+# Legacy function names for compatibility
 def encode_audio(wav_path, secret_data_text, output_path, n_bits=1, key=None):
+    """Legacy wrapper for GUI compatibility - encodes text payload"""
     if key is None:
         raise ValueError("Key is required for encoding (audio).")
-    with wave.open(wav_path, "rb") as audio:
-        params = audio.getparams()
-        frames = bytearray(audio.readframes(audio.getnframes()))
-    secret_bytes = secret_data_text.encode("utf-8") + STOP_MARKER
-    data_bits = ''.join(format(b, '08b') for b in secret_bytes)
-    max_bits = len(frames) * n_bits
-    if len(data_bits) > max_bits:
-        raise ValueError(f"Payload too large! Capacity: {max_bits} bits, Required: {len(data_bits)} bits.")
-    coords = generate_coords(len(frames), key)
-    mask = ~((1 << n_bits) - 1) & 0xFF
-    bit_index = 0
-    for idx in coords:
-        if bit_index >= len(data_bits):
-            break
-        chunk = data_bits[bit_index:bit_index+n_bits]
-        bit_index += n_bits
-        val = int(chunk.ljust(n_bits, '0'), 2)
-        frames[idx] = (frames[idx] & mask) | val
-    with wave.open(output_path, "wb") as out:
-        out.setparams(params)
-        out.writeframes(frames)
+    # Create a temporary file with the text content
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_file:
+        temp_file.write(secret_data_text)
+        temp_file_path = temp_file.name
+    try:
+        encode_audio_with_key(wav_path, False, secret_data_text, output_path, str(key), n_bits)
+    finally:
+        try:
+            os.unlink(temp_file_path)
+        except:
+            pass
 
 def decode_audio(wav_path, n_bits=1, key=None):
+    """Legacy wrapper for GUI compatibility - simplified decode for text"""
     if key is None:
         raise ValueError("Key is required for decoding (audio).")
+    # For GUI integration, we'll assume full audio decode without time segments for now
+    # This is a simplified version - the GUI will use the full function with segments
     with wave.open(wav_path, "rb") as audio:
-        frames = bytearray(audio.readframes(audio.getnframes()))
-    coords = generate_coords(len(frames), key)
-    bits = ""
-    out = bytearray()
-    for idx in coords:
-        bits += format(frames[idx] & ((1 << n_bits) - 1), f'0{n_bits}b')
-        while len(bits) >= 8:
-            byte = int(bits[:8], 2)
-            bits = bits[8:]
-            out.append(byte)
-            if out.endswith(STOP_MARKER):
-                return out[:-len(STOP_MARKER)].decode("utf-8", errors="replace")
-    raise ValueError("Stop marker not found in audio payload.")
+        sample_rate = audio.getframerate()
+        total_frames = audio.getnframes()
+        total_duration = total_frames / sample_rate
+    
+    # Use the full audio duration
+    return decode_audio_with_key(wav_path, str(key), 0, total_duration, n_bits)
 
 # ==========================
 # Small helpers
@@ -562,9 +849,38 @@ class StegoMainWindow(QMainWindow):
         form.addRow("Key:", s['key'])
 
         settings.setLayout(form)
+        if media == "image":
+            s['mode_text'] = QRadioButton("Text")
+            s['mode_file'] = QRadioButton("File")
+            s['mode_file'].setChecked(True)
+            mode_row = QHBoxLayout()
+            mode_row.addWidget(QLabel("Payload Type:"))
+            mode_row.addWidget(s['mode_text'])
+            mode_row.addWidget(s['mode_file'])
+            form.addRow(mode_row)
 
+            s['text_input'] = QLineEdit()
+            s['text_input'].setPlaceholderText("Enter secret message (Text mode)")
+            style_line_edit(s['text_input'])
+            form.addRow("Text:", s['text_input'])
+
+            # Region fields (auto-filled from preview selection)
+            s['x1'] = QSpinBox(); s['x1'].setRange(0, 10000)
+            s['y1'] = QSpinBox(); s['y1'].setRange(0, 10000)
+            s['x2'] = QSpinBox(); s['x2'].setRange(0, 10000)
+            s['y2'] = QSpinBox(); s['y2'].setRange(0, 10000)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("x1:")); row.addWidget(s['x1'])
+            row.addWidget(QLabel("y1:")); row.addWidget(s['y1'])
+            row.addWidget(QLabel("x2:")); row.addWidget(s['x2'])
+            row.addWidget(QLabel("y2:")); row.addWidget(s['y2'])
+            form.addRow("Region:", row)
+
+            # Toggle visibility based on payload type
+            s['mode_text'].toggled.connect(lambda _c, m=media: self._update_payload_ui(m))
+            s['mode_file'].toggled.connect(lambda _c, m=media: self._update_payload_ui(m))
         # --- AUDIO SEGMENT SELECTOR (only for audio) ---
-        if media == "audio":
+        elif media == "audio":
             segment_grp = QGroupBox("⏱️ Select Audio Segment")
             seg_layout = QVBoxLayout()
             seg_layout.setSpacing(8)
@@ -1136,8 +1452,9 @@ class StegoMainWindow(QMainWindow):
         if not key_text:
             QMessageBox.warning(self, "Missing key", "Key/passphrase is required for decoding.")
             return
+        n_bits = s['lsb'].value()
         try:
-            payload_bytes = bmp_decode(stego,key_text=key_text)  # auto-detects region/lsb & may save decoded_<filename>
+            payload_bytes = bmp_decode(stego, key_text, n_bits)
             self.state['image']['last_extracted_bytes'] = payload_bytes
 
             # 1) Try to preview bytes as an image (PNG/JPG/GIF/BMP)
@@ -1188,170 +1505,57 @@ class StegoMainWindow(QMainWindow):
         n_bits = s['lsb'].value()
         key_text = s['key'].text().strip()
 
-        if not cover:
-            QMessageBox.warning(self, "Error", "Select an audio cover (WAV or MP3).")
-            return
-        if not payload_path:
-            QMessageBox.warning(self, "Error", "Select a payload file.")
+        if not cover or not payload_path or not key_text:
+            QMessageBox.warning(self, "Error", "Select a cover WAV, payload, and enter a key.")
             return
 
-
-        # Handle MP3 conversion if needed
-        working_cover = cover
-        temp_files = []
-        
         try:
-            if cover.lower().endswith('.mp3'):
-                if not HAS_PYDUB:
-                    QMessageBox.warning(self, "Error", "MP3 support requires pydub. Please install it or use WAV files.")
-                    return
-                working_cover = convert_mp3_to_wav(cover)
-                temp_files.append(working_cover)
+            output = cover.replace(".wav", "_stego.wav")
 
-            # Load WAV to get sample rate and duration
-            with wave.open(working_cover, "rb") as wf:
-                frame_rate = wf.getframerate()
-                total_frames = wf.getnframes()
-                total_duration = total_frames / frame_rate
+            # Get start/end times from sliders
+            start_sec = s['start_slider'].value() if 'start_slider' in s else 0
+            end_sec = s['end_slider'].value() if 'end_slider' in s else None
 
-            # Get selected segment from sliders
-            start_sec = s['start_slider'].value()
-            end_sec = s['end_slider'].value()
+            if s.get('mode_text') and s['mode_text'].isChecked():
+                encode_audio_with_key(cover, False, s['text_input'].toPlainText(),
+                                    output, key_text, n_bits, start_sec, end_sec)
+            else:
+                encode_audio_with_key(cover, True, payload_path,
+                                    output, key_text, n_bits, start_sec, end_sec)
 
-            if end_sec > total_duration:
-                QMessageBox.warning(self, "Warning", f"End time ({end_sec}s) exceeds audio length ({total_duration:.1f}s). Truncating.")
-                end_sec = int(total_duration)
-                s['end_slider'].setValue(end_sec)
-
-            if start_sec >= end_sec:
-                QMessageBox.warning(self, "Error", "Start time must be before end time.")
-                return
-
-            # Convert to frame indices
-            start_frame = int(start_sec * frame_rate)
-            end_frame = int(end_sec * frame_rate)
-
-            # Ensure we don't exceed audio length
-            end_frame = min(end_frame, total_frames)
-
-            # Calculate available bits in segment
-            segment_frames = end_frame - start_frame
-            required_bytes = len(load_binary_as_text(payload_path).encode('utf-8'))
-            required_bits = required_bytes * 8
-            available_bits = segment_frames * n_bits
-
-            if required_bits > available_bits:
-                QMessageBox.critical(self, "Capacity Exceeded",
-                    f"Payload requires {required_bits} bits.\n"
-                    f"Selected segment ({start_sec}-{end_sec}s) can only hold {available_bits} bits with {n_bits} LSBs.\n"
-                    f"Try increasing LSBs or extending the segment.")
-                return
-
-            output = "stego_output.wav"
-            payload_text = load_binary_as_text(payload_path)
-
-            # Perform encoding
-            encode_audio(working_cover, payload_text, output, n_bits, int(key_text))
+            QMessageBox.information(self, "Success", f"Encoded audio saved to {output}")
             self.state['audio']['last_stego'] = output
-            
-            # Update status 
-            s['status'].setText(f"✅ Stego created: {output}\nSegment used: {start_sec}–{end_sec}s ({segment_frames} frames)")
-            
-            # Show stego preview section and load the stego audio
-            if 'stego_preview_section' in s:
-                s['stego_preview_section'].setVisible(True)
+
+            # Update preview
             if 'stego_preview' in s:
                 s['stego_preview'].load_audio(output)
-            if 'info_label' in s:
-                s['info_label'].setVisible(False)
-            # ---- Post-encode summary popup (audio) ----
-            orig_payload_size = os.path.getsize(payload_path)
-            embedded_size = len(payload_text.encode("utf-8"))  # base64 size actually embedded
-            available_bytes = (available_bits // 8)
-            overhead = embedded_size - orig_payload_size
-
-            extra = [
-                f"<b>Segment:</b> {start_sec}s – {end_sec}s",
-                f"<b>Segment Capacity:</b> {_fmt_bytes(available_bytes)} ({available_bits} bits @ {n_bits} LSBs)",
-                f"<b>Original File Size:</b> {_fmt_bytes(orig_payload_size)}",
-                f"<b>Embedded (Base64) Size:</b> {_fmt_bytes(embedded_size)}",
-                f"<b>Base64 Overhead:</b> {'+' if overhead >= 0 else ''}{_fmt_bytes(overhead)}",
-            ]
-
-            self._show_encode_summary(
-                media="audio",
-                cover=cover,
-                output=output,
-                payload_label=os.path.basename(payload_path),
-                payload_size=embedded_size,
-                n_bits=n_bits,
-                key_text=key_text,
-                extra_lines=extra
-            )
-
+            if 'stego_preview_section' in s:
+                s['stego_preview_section'].setVisible(True)
 
         except Exception as e:
             QMessageBox.critical(self, "Encoding Failed", str(e))
-        finally:
-            # Clean up temporary files
-            for temp_file in temp_files:
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
+
+
 
     def _run_decoding_audio(self):
         s = self.state['audio']['decode']
         stego = s.get('stego_path')
         n_bits = s['lsb'].value()
-        key_text = s['key'].text().strip() if 'key' in s else ""
-        
-        if not stego:
-            QMessageBox.warning(self, "Error", "Select a stego audio file (WAV or MP3).")
+        key_text = s['key'].text().strip()
+
+        if not stego or not key_text:
+            QMessageBox.warning(self, "Error", "Select a stego WAV and enter a key.")
             return
 
-            
-        # Handle MP3 conversion if needed
-        working_stego = stego
-        temp_files = []
-        
         try:
-            if stego.lower().endswith('.mp3'):
-                if not HAS_PYDUB:
-                    QMessageBox.warning(self, "Error", "MP3 support requires pydub. Please install it or use WAV files.")
-                    return
-                working_stego = convert_mp3_to_wav(stego)
-                temp_files.append(working_stego)
-            
-            # Decode the audio
-            text = decode_audio(working_stego, n_bits, int(key_text))
-            
-            # Update preview
-            if 'preview' not in s:
-                s['preview'] = QTextEdit()
-                s['preview'].setReadOnly(True)
-                style_text_edit(s['preview'])
-            s['preview'].setPlainText(text)
-            
-            # Hide info label
-            if 'info_label' in s:
-                s['info_label'].setVisible(False)
-            
-            s['status'] = s.get('status') or QLabel()
-            s['status'].setText("✅ Payload extracted (BASE64 TEXT). Use 'Save Extracted...' to write binary.")
+            # Auto full decode: don’t pass start/end
+            text = decode_audio_with_key(stego, key_text, n_bits=n_bits)
+            s['preview'].setPlainText(text if text else "(no payload found)")
             self.state['audio']['last_extracted_text'] = text
-            
+            QMessageBox.information(self, "Success", "Decoded payload extracted.")
         except Exception as e:
             QMessageBox.critical(self, "Decoding Failed", str(e))
-        finally:
-            # Clean up temporary files
-            for temp_file in temp_files:
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
 
-    # Save handlers
     def _save_last_stego(self, media):
         path = self.state[media].get('last_stego')
         if not path or not os.path.exists(path):
@@ -1409,6 +1613,8 @@ class StegoMainWindow(QMainWindow):
                         QMessageBox.information(self, "Saved", f"Saved: {fname}")
                     except Exception as e:
                         QMessageBox.critical(self, "Save Failed", str(e))
+
+
 
 # ==========================
 # Theme

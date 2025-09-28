@@ -562,9 +562,38 @@ class StegoMainWindow(QMainWindow):
         form.addRow("Key:", s['key'])
 
         settings.setLayout(form)
+        if media == "image":
+            s['mode_text'] = QRadioButton("Text")
+            s['mode_file'] = QRadioButton("File")
+            s['mode_file'].setChecked(True)
+            mode_row = QHBoxLayout()
+            mode_row.addWidget(QLabel("Payload Type:"))
+            mode_row.addWidget(s['mode_text'])
+            mode_row.addWidget(s['mode_file'])
+            form.addRow(mode_row)
 
+            s['text_input'] = QLineEdit()
+            s['text_input'].setPlaceholderText("Enter secret message (Text mode)")
+            style_line_edit(s['text_input'])
+            form.addRow("Text:", s['text_input'])
+
+            # Region fields (auto-filled from preview selection)
+            s['x1'] = QSpinBox(); s['x1'].setRange(0, 10000)
+            s['y1'] = QSpinBox(); s['y1'].setRange(0, 10000)
+            s['x2'] = QSpinBox(); s['x2'].setRange(0, 10000)
+            s['y2'] = QSpinBox(); s['y2'].setRange(0, 10000)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("x1:")); row.addWidget(s['x1'])
+            row.addWidget(QLabel("y1:")); row.addWidget(s['y1'])
+            row.addWidget(QLabel("x2:")); row.addWidget(s['x2'])
+            row.addWidget(QLabel("y2:")); row.addWidget(s['y2'])
+            form.addRow("Region:", row)
+
+            # Toggle visibility based on payload type
+            s['mode_text'].toggled.connect(lambda _c, m=media: self._update_payload_ui(m))
+            s['mode_file'].toggled.connect(lambda _c, m=media: self._update_payload_ui(m))
         # --- AUDIO SEGMENT SELECTOR (only for audio) ---
-        if media == "audio":
+        elif media == "audio":
             segment_grp = QGroupBox("⏱️ Select Audio Segment")
             seg_layout = QVBoxLayout()
             seg_layout.setSpacing(8)

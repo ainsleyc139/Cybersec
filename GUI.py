@@ -784,7 +784,8 @@ class WaveformComparisonWidget(QWidget):
 
         self.figure.tight_layout()
         self.canvas.draw()
-        
+
+       
 # ==========================
 # Main Window
 # ==========================
@@ -826,6 +827,11 @@ class StegoMainWindow(QMainWindow):
         lbl_dec = QLabel("Decode"); lbl_dec.setStyleSheet("color:#ddd; font-weight:600;")
         header.addWidget(lbl_enc); header.addSpacing(12); header.addWidget(toggle); header.addSpacing(12); header.addWidget(lbl_dec)
         header.addStretch(1)
+        reset_btn = QPushButton("🔄 Reset")
+        reset_btn.setFixedWidth(80)
+        reset_btn.setStyleSheet("QPushButton { background:#333; color:#fff; padding:4px; }")
+        reset_btn.clicked.connect(lambda checked=False, m=media_type: self._reset_tab(m))
+        header.addWidget(reset_btn)
         v.addLayout(header)
 
         stack = QStackedWidget()
@@ -1029,8 +1035,6 @@ class StegoMainWindow(QMainWindow):
             segment_grp.setLayout(seg_layout)
             lv.addWidget(segment_grp)
 
-        # ACTIONS
-        # ACTIONS
         act = QHBoxLayout()
 
         if media == "audio":
@@ -1270,11 +1274,37 @@ class StegoMainWindow(QMainWindow):
         right = QWidget()
         rv = QVBoxLayout()
         if media == "image":
+            # Image preview (for visual payloads like PNG/JPG/GIF)
             s['decode_preview'] = ImagePreviewSelector()
             rv.addWidget(s['decode_preview'])
-            note = QLabel("Tip: Region is auto-detected from header.\n(Selection disabled in decode.)")
-            note.setStyleSheet("color:#aaa;")
-            rv.addWidget(note, alignment=Qt.AlignRight)
+
+            # Separator
+            separator = QLabel()
+            separator.setFixedHeight(1)
+            separator.setStyleSheet("background-color:#333; margin:10px 0;")
+            rv.addWidget(separator)
+
+            # Extracted payload section
+            payload_title = QLabel("📄 Extracted Payload")
+            payload_title.setAlignment(Qt.AlignCenter)
+            payload_title.setStyleSheet("color:#4CAF50; font-weight:bold; font-size:14px; margin:10px 0;")
+            rv.addWidget(payload_title)
+
+            # Text/file preview box
+            s['preview'] = QTextEdit()
+            s['preview'].setReadOnly(True)
+            s['preview'].setPlaceholderText("Extracted payload will appear here…")
+            s['preview'].setMinimumHeight(120)
+            style_text_edit(s['preview'])
+            rv.addWidget(s['preview'])
+
+            # Info label
+            info_label = QLabel("Load a stego image and decode to see extracted content")
+            info_label.setAlignment(Qt.AlignCenter)
+            info_label.setStyleSheet("color:#aaa; font-size:12px;")
+            rv.addWidget(info_label)
+            s['info_label'] = info_label
+
         else:
             # Audio preview and controls
             audio_container = QWidget()
@@ -1872,49 +1902,40 @@ class StegoMainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing key", "Key/passphrase is required for decoding.")
             return
         n_bits = s['lsb'].value()
+
         try:
             payload_bytes = bmp_decode(stego, key_text, n_bits)
             self.state['image']['last_extracted_bytes'] = payload_bytes
 
-            # 1) Try to preview bytes as an image (PNG/JPG/GIF/BMP)
-            preview_widget = s.get('decode_preview')
-            previewed = self._preview_bytes_as_image(payload_bytes, preview_widget) if preview_widget else False
-
-            # 2) Try to locate an auto-saved file named decoded_<...>
-            auto_saved_msg = ""
-            try:
-                candidate_dirs = [os.getcwd(), os.path.dirname(stego)]
-                found_path = None
-                newest_mtime = -1
-                for d in candidate_dirs:
-                    if not d: continue
-                    for name in os.listdir(d):
-                        if name.lower().startswith("decoded_"):
-                            full = os.path.join(d, name)
-                            try:
-                                m = os.path.getmtime(full)
-                                if m > newest_mtime:
-                                    newest_mtime, found_path = m, full
-                            except Exception:
-                                pass
-                if found_path:
-                    auto_saved_msg = f" Auto-saved: {os.path.basename(found_path)}"
-            except Exception:
-                pass
-
-            # 3) Decide message: text vs file
+            # Try to decode as text
             try:
                 text = payload_bytes.decode("utf-8")
                 self.state['image']['last_extracted_text'] = text
-                s['status'].setText("✅ Payload extracted (TEXT). Use 'Save Extracted…' to save bytes." + auto_saved_msg)
+                if 'preview' in s:
+                    s['preview'].setPlainText(text)
+                s['status'].setText("✅ Payload extracted (TEXT)")
             except UnicodeDecodeError:
+                # Not plain text → show hex preview
+                hex_preview = payload_bytes[:500].hex()
+                preview_text = f"Binary payload extracted ({len(payload_bytes)} bytes)\n\n"
+                preview_text += f"Hex preview (first 500 bytes):\n{hex_preview}"
+                if 'preview' in s:
+                    s['preview'].setPlainText(preview_text)
+                s['status'].setText("✅ Payload extracted (FILE – binary)")
+
+            # Also update image preview if bytes look like an image
+            previewed = False
+            if 'decode_preview' in s:
+                previewed = self._preview_bytes_as_image(payload_bytes, s['decode_preview'])
                 if previewed:
-                    s['status'].setText("✅ Payload extracted (FILE – looks like an image)." + auto_saved_msg)
-                else:
-                    s['status'].setText("✅ Payload extracted (FILE)." + auto_saved_msg)
+                    s['status'].setText("✅ Payload extracted (IMAGE file)")
+
+            if 'info_label' in s:
+                s['info_label'].setVisible(False)
 
         except Exception as e:
             QMessageBox.critical(self, "Decoding Failed", str(e))
+
 
     # ---- Audio (key-shuffled, text payload demo) ----
     def _run_encoding_audio(self, preview_only=False):
@@ -2104,6 +2125,30 @@ class StegoMainWindow(QMainWindow):
                         QMessageBox.critical(self, "Save Failed", str(e))
             else:
                 QMessageBox.warning(self, "Error", "Nothing extracted yet.")
+
+    def _reset_tab(self, media: str):
+        """Reset all state, fields, and previews for the given media ('image' or 'audio')."""
+        # Reset state dict
+        self.state[media]['encode'].clear()
+        self.state[media]['decode'].clear()
+        self.state[media]['last_stego'] = None
+        self.state[media]['last_extracted_bytes'] = None
+        self.state[media]['last_extracted_text'] = None
+
+        # Now rebuild the UI for that tab
+        # Find which tab to rebuild
+        tabs: QTabWidget = self.centralWidget().layout().itemAt(0).widget()
+        if media == "image":
+            tab_index = 0
+        else:
+            tab_index = 1
+
+        tab_widget = tabs.widget(tab_index)
+        new_tab = QWidget()
+        self.setup_media_tab(new_tab, media)
+        tabs.removeTab(tab_index)
+        tabs.insertTab(tab_index, new_tab, "🖼️ Image / GIF" if media == "image" else "🔊 Audio")
+        tabs.setCurrentIndex(tab_index)
 
 # ==========================
 # Theme

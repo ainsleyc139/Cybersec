@@ -1786,7 +1786,7 @@ class StegoMainWindow(QMainWindow):
         # Payload mode
         if 'mode_text' in s and s['mode_text'].isChecked():
             is_file = False
-            payload_arg = s['text_input'].text()
+            payload_arg = s['text_input'].toPlainText()
             if not payload_arg:
                 QMessageBox.warning(self, "Error", "Enter the secret message (Text mode).")
                 return

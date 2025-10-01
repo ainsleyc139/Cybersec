@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGroupBox, QLineEdit, QFormLayout, QTabWidget, QSpinBox, QTextEdit,
     QFileDialog, QMessageBox, QStackedWidget, QSizePolicy, QRadioButton,
-    QRubberBand, QSplitter, QSlider, QProgressBar
+    QRubberBand, QSplitter, QSlider, QProgressBar, QDialog
 )
 
 # Try to import pydub for MP3 support
@@ -1030,8 +1030,8 @@ class StegoMainWindow(QMainWindow):
 
         # ACTIONS
         act = QHBoxLayout()
-        enc_btn = QPushButton("🚀 Encode"); enc_btn.clicked.connect(lambda checked=False, m=media: self.run_encoding(m))
-        save_btn = QPushButton("💾 Save Stego As…"); save_btn.clicked.connect(lambda checked=False, m=media: self._save_last_stego(m))
+        enc_btn = QPushButton("🚀 Calculate Size"); enc_btn.clicked.connect(lambda checked=False, m=media: self.run_encoding(m))
+        save_btn = QPushButton("💾 Encode and Save…"); save_btn.clicked.connect(lambda checked=False, m=media: self._save_last_stego(m))
         act.addWidget(enc_btn); act.addWidget(save_btn); act.addStretch(1)
 
         s['status'] = QLabel(); s['status'].setWordWrap(True); s['status'].setStyleSheet("color:#9ad;")
@@ -1319,6 +1319,69 @@ class StegoMainWindow(QMainWindow):
             s['payload_label'].setVisible(not is_text)
         if 'payload_choose_btn' in s: 
             s['payload_choose_btn'].setVisible(not is_text)
+    def _show_image_comparison_popup(self, original_path, stego_path, payload_size, n_bits):
+        """Show a popup with before/after images and capacity details."""
+        if not (original_path and stego_path):
+            return
+
+        # --- Compute details ---
+        import cv2, os
+        img = cv2.imread(original_path, cv2.IMREAD_COLOR)
+        h, w, ch = img.shape if img is not None else (0,0,0)
+        cover_pixels = h * w
+        cover_capacity_bits = cover_pixels * ch * n_bits
+        cover_capacity_bytes = cover_capacity_bits // 8
+
+        payload_bytes = payload_size
+        sufficiency = "✅ Sufficient capacity" if payload_bytes <= cover_capacity_bytes else "❌ Insufficient capacity"
+
+        # --- Dialog UI ---
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Before & After Comparison")
+        dialog.resize(1100, 650)
+
+        main_layout = QVBoxLayout()
+
+        # Image comparison row
+        img_layout = QHBoxLayout()
+        orig_label = QLabel()
+        orig_pix = QPixmap(original_path)
+        orig_label.setPixmap(orig_pix.scaled(450, 450, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        orig_label.setAlignment(Qt.AlignCenter)
+
+        stego_label = QLabel()
+        stego_pix = QPixmap(stego_path)
+        stego_label.setPixmap(stego_pix.scaled(450, 450, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        stego_label.setAlignment(Qt.AlignCenter)
+
+        img_layout.addWidget(orig_label)
+        img_layout.addWidget(stego_label)
+        main_layout.addLayout(img_layout)
+
+        # Details row
+        details = QTextEdit()
+        details.setReadOnly(True)
+        details.setMinimumHeight(140)
+        details.setStyleSheet("color:#ddd; background:#222; border:1px solid #444; font-family:monospace;")
+        details.setText(
+            f"📊 Cover Details:\n"
+            f" - Resolution: {w} x {h}\n"
+            f" - Channels: {ch}\n"
+            f" - Total Pixels: {cover_pixels}\n"
+            f" - LSBs Used: {n_bits}\n"
+            f" - Capacity: {cover_capacity_bytes} bytes\n\n"
+            f"📦 Payload:\n"
+            f" - Size: {payload_bytes} bytes\n\n"
+            f"⚖️ Comparison:\n"
+            f" - {sufficiency}\n"
+            f" - Stego File: {os.path.basename(stego_path)}"
+        )
+
+        main_layout.addWidget(details)
+
+        dialog.setLayout(main_layout)
+        dialog.exec()
+
 
     def _set_file(self, media, mode, which, path):
         s = self.state[media][mode]
@@ -1843,6 +1906,7 @@ class StegoMainWindow(QMainWindow):
         if not path or not os.path.exists(path):
             QMessageBox.warning(self, "Error", "No stego file generated yet.")
             return
+        
         ext = ".wav" if media == "audio" else ".bmp"
         fname, _ = QFileDialog.getSaveFileName(self, "Save Stego As", "", f"*{ext}")
         if fname:
@@ -1852,8 +1916,26 @@ class StegoMainWindow(QMainWindow):
                 os.replace(path, fname)
                 self.state[media]['last_stego'] = fname
                 QMessageBox.information(self, "Saved", f"Stego saved: {fname}")
+
+                # === NEW: show popup for image ===
+                if media == "image":
+                    s = self.state['image']['encode']
+                    orig = s.get('cover_path')
+                    n_bits = s['lsb'].value()
+
+                    # payload size: if text mode, use string length, else file size
+                    if s.get('mode_text') and s['mode_text'].isChecked():
+                        payload_size = len(s['text_input'].toPlainText().encode("utf-8"))
+                    else:
+                        payload_size = os.path.getsize(s.get('payload_path')) if s.get('payload_path') else 0
+
+                    self._show_image_comparison_popup(orig, fname, payload_size, n_bits)
+
+
             except Exception as e:
                 QMessageBox.critical(self, "Save Failed", str(e))
+
+
 
     def _save_extracted(self, media):
         if media == "image":

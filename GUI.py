@@ -1951,20 +1951,27 @@ class StegoMainWindow(QMainWindow):
 
         # Else, actually encode + save
         try:
-            output = cover.replace(".wav", "_stego.wav")
-            if not output.endswith("_stego.wav"):
-                output = "stego_output.wav"
+            # === Save As dialog (instead of hardcoding path) ===
+            out_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Encoded Audio",
+                "stego_output.wav",
+                "WAV files (*.wav)"
+            )
+            if not out_path:
+                return  # user cancelled
 
-            encode_audio_with_key(cover, is_file, payload, output, key_text, n_bits, start_sec, end_sec)
-            QMessageBox.information(self, "Success", f"Encoded audio saved to {output}")
-            self.state['audio']['last_stego'] = output
+            encode_audio_with_key(cover, is_file, payload, out_path, key_text, n_bits, start_sec, end_sec)
+            QMessageBox.information(self, "Success", f"Encoded audio saved to {out_path}")
+            self.state['audio']['last_stego'] = out_path
 
             if 'waveform_widget' in s:
-                s['waveform_widget'].load_stego(output)
+                s['waveform_widget'].load_stego(out_path)
             if 'stego_preview' in s:
-                s['stego_preview'].load_audio(output)
+                s['stego_preview'].load_audio(out_path)
             if 'stego_preview_section' in s:
                 s['stego_preview_section'].setVisible(True)
+
         except Exception as e:
             QMessageBox.critical(self, "Encoding Failed", str(e))
 
@@ -2023,7 +2030,7 @@ class StegoMainWindow(QMainWindow):
     def _save_last_stego(self, media):
         path = self.state[media].get('last_stego')
         if not path or not os.path.exists(path):
-            QMessageBox.warning(self, "Error", "No stego file generated yet.")
+            QMessageBox.warning(self, "Error", "Please calculate size before encoding and saving.")
             return
         
         ext = ".wav" if media == "audio" else ".bmp"
